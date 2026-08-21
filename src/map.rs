@@ -27,6 +27,13 @@ const FOUNDATION_STRIPE_SPACING: f32 = 18.0;
 const ALL_RESOURCES_FILTER: &str = "__all_resources__";
 const ALL_PURITY_FILTER: &str = "__all_purities__";
 
+#[derive(Clone, Copy)]
+enum MovingAnnotation {
+    Circle(usize),
+    Arrow(usize),
+    Text(usize),
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ResourceWellTotals {
     used_per_minute: f32,
@@ -108,6 +115,8 @@ pub struct MapView {
     rectangle_popup_position: Option<egui::Pos2>,
     moving_rectangle: Option<usize>,
     rectangle_move_offset: Option<egui::Vec2>,
+    moving_annotation: Option<MovingAnnotation>,
+    annotation_move_offset: Option<egui::Vec2>,
     text_edit_world: Option<egui::Vec2>,
     text_edit_buffer: String,
     drawing_history: Vec<MapAnnotation>,
@@ -173,6 +182,8 @@ impl Default for MapView {
             rectangle_popup_position: None,
             moving_rectangle: None,
             rectangle_move_offset: None,
+            moving_annotation: None,
+            annotation_move_offset: None,
             text_edit_world: None,
             text_edit_buffer: String::new(),
             drawing_history: Vec::new(),
@@ -305,16 +316,24 @@ impl MapView {
         self.rectangle_popup_position = None;
         self.moving_rectangle = None;
         self.rectangle_move_offset = None;
+        self.moving_annotation = None;
+        self.annotation_move_offset = None;
     }
 
     pub fn set_circles(&mut self, circles: Vec<MapCircle>) {
         self.circles = circles;
         self.circle_save_requested = false;
+        self.selected_circle = None;
+        self.moving_annotation = None;
+        self.annotation_move_offset = None;
     }
 
     pub fn set_arrows(&mut self, arrows: Vec<MapArrow>) {
         self.arrows = arrows;
         self.arrow_save_requested = false;
+        self.selected_arrow = None;
+        self.moving_annotation = None;
+        self.annotation_move_offset = None;
     }
 
     pub fn set_texts(&mut self, texts: Vec<MapText>) {
@@ -323,6 +342,8 @@ impl MapView {
         self.selected_text = None;
         self.text_edit_world = None;
         self.text_edit_buffer.clear();
+        self.moving_annotation = None;
+        self.annotation_move_offset = None;
     }
 
     pub fn set_drawing_history(&mut self, history: Vec<MapAnnotation>) {
@@ -348,6 +369,60 @@ impl MapView {
         {
             self.drawing_history.remove(index);
             self.drawing_history_save_requested = true;
+        }
+    }
+
+    fn moving_annotation_anchor(&self, moving: MovingAnnotation) -> Option<egui::Vec2> {
+        match moving {
+            MovingAnnotation::Circle(index) => self
+                .circles
+                .get(index)
+                .map(|circle| egui::vec2(circle.center_world_x, circle.center_world_y)),
+            MovingAnnotation::Arrow(index) => self
+                .arrows
+                .get(index)
+                .map(|arrow| egui::vec2(arrow.start_world_x, arrow.start_world_y)),
+            MovingAnnotation::Text(index) => self
+                .texts
+                .get(index)
+                .map(|annotation| egui::vec2(annotation.world_x, annotation.world_y)),
+        }
+    }
+
+    fn move_annotation_to(&mut self, moving: MovingAnnotation, anchor: egui::Vec2) {
+        match moving {
+            MovingAnnotation::Circle(index) => {
+                if let Some(circle) = self.circles.get_mut(index) {
+                    circle.center_world_x = anchor.x;
+                    circle.center_world_y = anchor.y;
+                }
+            }
+            MovingAnnotation::Arrow(index) => {
+                if let Some(arrow) = self.arrows.get_mut(index) {
+                    let delta = egui::vec2(
+                        anchor.x - arrow.start_world_x,
+                        anchor.y - arrow.start_world_y,
+                    );
+                    arrow.start_world_x = anchor.x;
+                    arrow.start_world_y = anchor.y;
+                    arrow.end_world_x += delta.x;
+                    arrow.end_world_y += delta.y;
+                }
+            }
+            MovingAnnotation::Text(index) => {
+                if let Some(annotation) = self.texts.get_mut(index) {
+                    annotation.world_x = anchor.x;
+                    annotation.world_y = anchor.y;
+                }
+            }
+        }
+    }
+
+    fn mark_annotation_save(&mut self, moving: MovingAnnotation) {
+        match moving {
+            MovingAnnotation::Circle(_) => self.circle_save_requested = true,
+            MovingAnnotation::Arrow(_) => self.arrow_save_requested = true,
+            MovingAnnotation::Text(_) => self.text_save_requested = true,
         }
     }
 
@@ -1125,6 +1200,31 @@ impl MapView {
                 self.moving_rectangle = None;
                 self.rectangle_move_offset = None;
             }
+        } else if let Some(moving) = self.moving_annotation {
+            if response.drag_started() {
+                if let Some(pointer) = response.interact_pointer_pos() {
+                    let pointer_world = self.world_at_screen(rect, pointer);
+                    self.annotation_move_offset = self
+                        .moving_annotation_anchor(moving)
+                        .map(|anchor| pointer_world - anchor);
+                }
+            }
+            if response.dragged() {
+                if let (Some(pointer), Some(offset)) =
+                    (response.interact_pointer_pos(), self.annotation_move_offset)
+                {
+                    let pointer_world = self.world_at_screen(rect, pointer);
+                    self.move_annotation_to(moving, pointer_world - offset);
+                    ui.ctx().request_repaint();
+                }
+            }
+            if response.drag_stopped() {
+                if self.annotation_move_offset.is_some() {
+                    self.mark_annotation_save(moving);
+                }
+                self.moving_annotation = None;
+                self.annotation_move_offset = None;
+            }
         } else if response.dragged() {
             self.pan += response.drag_delta();
         }
@@ -1187,7 +1287,11 @@ impl MapView {
         self.draw_resource_well_links(&painter, rect);
 
         let mut rectangle_context_opened = false;
-        if !drawing_tool_was_active && !text_tool_was_active && self.moving_rectangle.is_none() {
+        if !drawing_tool_was_active
+            && !text_tool_was_active
+            && self.moving_rectangle.is_none()
+            && self.moving_annotation.is_none()
+        {
             for (index, rectangle) in self.rectangles.iter().copied().enumerate() {
                 let screen_rectangle = world_rectangle_screen_rect(
                     rect,
@@ -1210,6 +1314,7 @@ impl MapView {
                     self.selected_rectangle = Some(index);
                     self.selected_circle = None;
                     self.selected_arrow = None;
+                    self.selected_text = None;
                     self.rectangle_popup_position = rectangle_response
                         .interact_pointer_pos()
                         .or_else(|| ui.input(|input| input.pointer.interact_pos()));
@@ -1218,7 +1323,10 @@ impl MapView {
             }
         }
 
-        if !drawing_tool_was_active && self.moving_rectangle.is_none() {
+        if !drawing_tool_was_active
+            && self.moving_rectangle.is_none()
+            && self.moving_annotation.is_none()
+        {
             for (index, circle) in self.circles.iter().copied().enumerate() {
                 let center = self.to_screen(rect, circle.center_world_x, circle.center_world_y);
                 let edge = self.to_screen(
@@ -1237,6 +1345,7 @@ impl MapView {
                     self.selected_rectangle = None;
                     self.selected_circle = Some(index);
                     self.selected_arrow = None;
+                    self.selected_text = None;
                     self.rectangle_popup_position = circle_response
                         .interact_pointer_pos()
                         .or_else(|| ui.input(|input| input.pointer.interact_pos()));
@@ -1255,6 +1364,7 @@ impl MapView {
                     self.selected_rectangle = None;
                     self.selected_circle = None;
                     self.selected_arrow = Some(index);
+                    self.selected_text = None;
                     self.rectangle_popup_position = arrow_response
                         .interact_pointer_pos()
                         .or_else(|| ui.input(|input| input.pointer.interact_pos()));
@@ -1381,6 +1491,8 @@ impl MapView {
                 self.cancel_text_edit();
             } else if self.moving_rectangle.take().is_some() {
                 self.rectangle_move_offset = None;
+            } else if self.moving_annotation.take().is_some() {
+                self.annotation_move_offset = None;
             } else if self.selected_rectangle.take().is_some() {
                 // Close the rectangle action popup.
                 self.rectangle_popup_position = None;
@@ -1422,9 +1534,13 @@ impl MapView {
                     self.selected_rectangle = None;
                     self.rectangle_popup_position = None;
                 }
-                if self.selected_circle.is_some() || self.selected_arrow.is_some() {
+                if self.selected_circle.is_some()
+                    || self.selected_arrow.is_some()
+                    || self.selected_text.is_some()
+                {
                     self.selected_circle = None;
                     self.selected_arrow = None;
+                    self.selected_text = None;
                     self.rectangle_popup_position = None;
                 }
             }
@@ -1440,7 +1556,8 @@ impl MapView {
         }
 
         let visible_count = self.visible_nodes().count();
-        painter.text(
+        draw_text_with_shadow(
+            &painter,
             rect.left_top() + egui::vec2(12.0, 12.0),
             egui::Align2::LEFT_TOP,
             format!(
@@ -1466,7 +1583,8 @@ impl MapView {
                 )
             })
             .unwrap_or_else(|| format!("{} · X — · Y —", text(self.language, "cursor_world")));
-        painter.text(
+        draw_text_with_shadow(
+            &painter,
             rect.center_bottom() - egui::vec2(0.0, 10.0),
             egui::Align2::CENTER_BOTTOM,
             cursor_text,
@@ -1607,6 +1725,7 @@ impl MapView {
         }
 
         let mut delete_requested = false;
+        let mut move_requested = false;
         let mut close_requested = false;
         let inner = egui::Area::new(egui::Id::new("selected-map-simple-annotation-popup"))
             .order(egui::Order::Foreground)
@@ -1623,12 +1742,17 @@ impl MapView {
                             close_requested = true;
                         }
                     });
-                    if ui
-                        .button(text(self.language, "delete_annotation"))
-                        .clicked()
-                    {
-                        delete_requested = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button(text(self.language, "move_annotation")).clicked() {
+                            move_requested = true;
+                        }
+                        if ui
+                            .button(text(self.language, "delete_annotation"))
+                            .clicked()
+                        {
+                            delete_requested = true;
+                        }
+                    });
                 });
             });
 
@@ -1655,6 +1779,17 @@ impl MapView {
                 }
                 self.selected_text = None;
             }
+            self.rectangle_popup_position = None;
+        } else if move_requested {
+            self.moving_annotation = Some(match kind {
+                0 => MovingAnnotation::Circle(index),
+                1 => MovingAnnotation::Arrow(index),
+                _ => MovingAnnotation::Text(index),
+            });
+            self.annotation_move_offset = None;
+            self.selected_circle = None;
+            self.selected_arrow = None;
+            self.selected_text = None;
             self.rectangle_popup_position = None;
         } else if close_requested {
             self.selected_circle = None;
@@ -2004,7 +2139,8 @@ impl MapView {
 
     fn draw_texts(&self, painter: &egui::Painter, rect: egui::Rect) {
         for annotation in &self.texts {
-            painter.text(
+            draw_text_with_shadow(
+                painter,
                 self.to_screen(rect, annotation.world_x, annotation.world_y),
                 egui::Align2::CENTER_CENTER,
                 &annotation.text,
@@ -2980,6 +3116,25 @@ fn unproject_map(map_x: egui::Vec2) -> egui::Vec2 {
 
 fn annotation_color(alpha: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(0xFF, 0x98, 0x25, alpha)
+}
+
+fn draw_text_with_shadow(
+    painter: &egui::Painter,
+    position: egui::Pos2,
+    align: egui::Align2,
+    value: impl ToString,
+    font_id: egui::FontId,
+    color: egui::Color32,
+) {
+    let value = value.to_string();
+    painter.text(
+        position + egui::vec2(1.5, 1.5),
+        align,
+        &value,
+        font_id.clone(),
+        egui::Color32::from_rgba_unmultiplied(0x08, 0x0D, 0x12, 210),
+    );
+    painter.text(position, align, value, font_id, color);
 }
 
 fn purity_color(node: &ResourceNode) -> egui::Color32 {

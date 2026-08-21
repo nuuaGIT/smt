@@ -70,6 +70,7 @@ pub fn text(language: Language, key: &str) -> &'static str {
         "circle" => ("Circle", "Kreis", "Cercle", "Círculo"),
         "arrow" => ("Arrow", "Pfeil", "Flèche", "Flecha"),
         "delete_annotation" => ("Delete drawing", "Zeichnung löschen", "Supprimer le dessin", "Eliminar dibujo"),
+        "move_annotation" => ("Move", "Verschieben", "Déplacer", "Mover"),
         "move_rectangle" => ("Move", "Verschieben", "Déplacer", "Mover"),
         "delete_rectangle" => ("Delete", "Löschen", "Supprimer", "Eliminar"),
         "error" => ("Error", "Fehler", "Erreur", "Error"),

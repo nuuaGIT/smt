@@ -888,13 +888,29 @@ impl eframe::App for TrackerApp {
 
 fn apply_flat_ui_style(context: &egui::Context) {
     let mut style = (*context.style()).clone();
+    let accent = egui::Color32::from_rgb(0x4B, 0xB4, 0xCE);
+    let normal_text = egui::Color32::from_rgb(0xD2, 0xD6, 0xD9);
 
-    // Keep egui's existing colors, but restore a deliberately old-school
-    // desktop look for UI containers. Map painting is completely independent.
+    // Keep the flat, old-school desktop look for containers while using a
+    // restrained cyan accent for interactive states and selections.
     style.visuals.window_rounding = egui::Rounding::ZERO;
     style.visuals.menu_rounding = egui::Rounding::ZERO;
     style.visuals.window_shadow = egui::Shadow::NONE;
     style.visuals.popup_shadow = egui::Shadow::NONE;
+    style.visuals.hyperlink_color = accent;
+    style.visuals.selection.bg_fill = accent.gamma_multiply(0.28);
+    style.visuals.selection.stroke = egui::Stroke::new(1.0_f32, accent);
+    style.visuals.widgets.hovered.weak_bg_fill = accent.gamma_multiply(0.14);
+    style.visuals.widgets.hovered.bg_stroke.color = accent;
+    style.visuals.widgets.active.weak_bg_fill = accent.gamma_multiply(0.24);
+    style.visuals.widgets.active.bg_stroke.color = accent;
+    style.visuals.widgets.open.weak_bg_fill = accent.gamma_multiply(0.18);
+    style.visuals.widgets.open.bg_stroke.color = accent;
+    style.visuals.widgets.noninteractive.fg_stroke.color = normal_text;
+    style.visuals.widgets.inactive.fg_stroke.color = normal_text;
+    style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::WHITE;
+    style.visuals.widgets.active.fg_stroke.color = egui::Color32::WHITE;
+    style.visuals.widgets.open.fg_stroke.color = egui::Color32::WHITE;
     for widget in [
         &mut style.visuals.widgets.noninteractive,
         &mut style.visuals.widgets.inactive,
