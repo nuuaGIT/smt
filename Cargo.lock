@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "satisfactory-resource-tracker"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "anyhow",
  "directories",
