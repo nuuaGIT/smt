@@ -1,3 +1,8 @@
+// Keep the portable Windows release a GUI application so Windows does not
+// create an extra console window next to SMT. Debug builds keep the console
+// available for development diagnostics.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 #[path = "save_parser_core/decompress.rs"]
 #[allow(dead_code, unexpected_cfgs)]
 mod decompress;

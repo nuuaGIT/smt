@@ -1,6 +1,6 @@
 [package]
 name = "satisfactory-resource-tracker"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 edition = "2021"
 default-run = "satisfactory-resource-tracker"
 
