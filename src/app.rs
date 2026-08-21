@@ -3,12 +3,125 @@ use crate::map::MapView;
 use crate::save_parser::parse_save_data;
 use crate::storage::{AppSettings, DiffSummary, Language, RefreshResult, SaveSnapshot, Storage};
 use eframe::egui;
+use image::AnimationDecoder;
 use rfd::FileDialog;
+use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type ParseResult = Result<crate::save_parser::ParsedSaveData, String>;
+
+const MIN_FIRST_STARTUP_LOADING_TIME: Duration = Duration::from_millis(3_333);
+const MIN_RELOAD_LOADING_TIME: Duration = Duration::from_millis(16);
+const LOADING_GIFS: [&[u8]; 8] = [
+    include_bytes!("../data/loading/hop-on-satisfactory-satisfactory.gif"),
+    include_bytes!("../data/loading/satisfactory-bug.gif"),
+    include_bytes!("../data/loading/satisfactory-clapping.gif"),
+    include_bytes!("../data/loading/satisfactory-game.gif"),
+    include_bytes!("../data/loading/satisfactory-gaming.gif"),
+    include_bytes!("../data/loading/satisfactory-get-real.gif"),
+    include_bytes!("../data/loading/satisfactory.gif"),
+    include_bytes!("../data/loading/scaveneil-dumbass.gif"),
+];
+static LOADING_SELECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct LoadingFrame {
+    image: egui::ColorImage,
+    duration: Duration,
+}
+
+struct LoadingState {
+    started_at: Instant,
+    minimum_duration: Duration,
+    frames: Vec<LoadingFrame>,
+    textures: Vec<Option<egui::TextureHandle>>,
+    assets_prepared: bool,
+}
+
+impl LoadingState {
+    fn new(minimum_duration: Duration) -> Self {
+        let frames = load_random_loading_gif();
+        let textures = (0..frames.len()).map(|_| None).collect();
+        Self {
+            started_at: Instant::now(),
+            minimum_duration,
+            frames,
+            textures,
+            assets_prepared: false,
+        }
+    }
+
+    fn frame_index(&self, elapsed: Duration) -> usize {
+        if self.frames.len() <= 1 {
+            return 0;
+        }
+        let total_nanos = self
+            .frames
+            .iter()
+            .map(|frame| frame.duration.as_nanos().max(1))
+            .sum::<u128>();
+        let mut position = elapsed.as_nanos() % total_nanos.max(1);
+        for (index, frame) in self.frames.iter().enumerate() {
+            let duration = frame.duration.as_nanos().max(1);
+            if position < duration {
+                return index;
+            }
+            position -= duration;
+        }
+        self.frames.len() - 1
+    }
+}
+
+fn load_random_loading_gif() -> Vec<LoadingFrame> {
+    let time_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| {
+            duration.as_secs().rotate_left(23) ^ u64::from(duration.subsec_nanos()).rotate_left(7)
+        })
+        .unwrap_or_default();
+    let counter_seed = LOADING_SELECTION_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let process_seed = u64::from(std::process::id()).rotate_left(31);
+    let mixed_seed = time_seed ^ counter_seed ^ process_seed;
+    let index =
+        (mixed_seed ^ (mixed_seed >> 29) ^ (mixed_seed >> 47)) as usize % LOADING_GIFS.len();
+    let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(LOADING_GIFS[index]));
+    let frames = decoder
+        .ok()
+        .and_then(|decoder| decoder.into_frames().collect_frames().ok())
+        .unwrap_or_default();
+
+    let decoded = frames
+        .into_iter()
+        .map(|frame| {
+            let (numerator, denominator) = frame.delay().numer_denom_ms();
+            let delay_millis = if denominator == 0 {
+                100
+            } else {
+                ((numerator as f64 / denominator as f64).round() as u64).clamp(16, 1_000)
+            };
+            let image = frame.into_buffer();
+            let size = [image.width() as usize, image.height() as usize];
+            LoadingFrame {
+                image: egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+                duration: Duration::from_millis(delay_millis),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if decoded.is_empty() {
+        vec![LoadingFrame {
+            image: egui::ColorImage::from_rgba_unmultiplied([1, 1], &[0x19, 0x1F, 0x24, 0xFF]),
+            duration: Duration::from_millis(100),
+        }]
+    } else {
+        decoded
+    }
+}
 
 pub struct TrackerApp {
     storage: Option<Storage>,
@@ -24,6 +137,8 @@ pub struct TrackerApp {
     right_panel_width: f32,
     right_panel_generation: u64,
     right_panel_edge_blocked: bool,
+    loading: Option<LoadingState>,
+    confirm_delete_all_smt_notes: bool,
 }
 
 impl TrackerApp {
@@ -43,6 +158,8 @@ impl TrackerApp {
                 right_panel_width: 320.0,
                 right_panel_generation: 0,
                 right_panel_edge_blocked: false,
+                loading: None,
+                confirm_delete_all_smt_notes: false,
             },
             Err(error) => Self {
                 storage: None,
@@ -58,6 +175,8 @@ impl TrackerApp {
                 right_panel_width: 320.0,
                 right_panel_generation: 0,
                 right_panel_edge_blocked: false,
+                loading: None,
+                confirm_delete_all_smt_notes: false,
             },
         };
 
@@ -87,6 +206,7 @@ impl TrackerApp {
             arrows,
             drawing_history,
             texts,
+            strokes,
         ) = app
             .storage
             .as_ref()
@@ -101,6 +221,7 @@ impl TrackerApp {
                     storage.active_arrows(),
                     storage.active_drawing_history(),
                     storage.active_texts(),
+                    storage.active_strokes(),
                 )
             })
             .unwrap_or_default();
@@ -110,6 +231,7 @@ impl TrackerApp {
         app.map.set_arrows(arrows);
         app.map.set_drawing_history(drawing_history);
         app.map.set_texts(texts);
+        app.map.set_strokes(strokes);
         app.language = settings.language;
         app.map.set_language(app.language);
         app.map.set_unclaimed_miner_tier(miner_tier);
@@ -121,15 +243,96 @@ impl TrackerApp {
             settings.only_claimed,
             settings.only_partial,
         );
+        app.map.set_selected_resources(settings.selected_resources);
         app.map.set_node_scale(settings.node_scale);
         app.map.set_show_grid(settings.show_grid);
+        app.map.set_show_annotations(settings.show_annotations);
         app.map.set_show_rails(settings.show_rails);
         app.map.set_show_foundations(settings.show_foundations);
         app.map.set_show_belts(settings.show_belts);
         app.debug_mode = settings.debug_mode;
         app.pause_map_when_unfocused = settings.pause_map_when_unfocused;
         app.right_panel_width = settings.right_panel_width.clamp(8.0, 720.0);
+        app.loading = Some(LoadingState::new(MIN_FIRST_STARTUP_LOADING_TIME));
         app
+    }
+
+    fn show_startup_loading(&mut self, context: &egui::Context) -> bool {
+        let Some(loading) = self.loading.as_ref() else {
+            return false;
+        };
+        let elapsed = loading.started_at.elapsed();
+        if elapsed >= loading.minimum_duration && self.parse_receiver.is_none() {
+            self.loading = None;
+            return false;
+        }
+
+        if self
+            .loading
+            .as_ref()
+            .is_some_and(|loading| !loading.assets_prepared)
+        {
+            self.map.prepare_assets(context);
+            if let Some(loading) = self.loading.as_mut() {
+                loading.assets_prepared = true;
+            }
+        }
+
+        let (texture, image_size) = {
+            let loading = self.loading.as_mut().expect("loading state exists");
+            let frame_index = loading.frame_index(elapsed);
+            if loading.textures[frame_index].is_none() {
+                let texture = context.load_texture(
+                    format!("startup-loading-frame-{frame_index}"),
+                    loading.frames[frame_index].image.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                loading.textures[frame_index] = Some(texture);
+            }
+            (
+                loading.textures[frame_index]
+                    .as_ref()
+                    .expect("loading texture was created")
+                    .clone(),
+                loading.frames[frame_index].image.size,
+            )
+        };
+
+        let screen = context.screen_rect();
+        let painter = context.layer_painter(egui::LayerId::new(
+            egui::Order::Background,
+            egui::Id::new("startup-loading-screen"),
+        ));
+        painter.rect_filled(screen, 0.0, egui::Color32::from_rgb(0x19, 0x1F, 0x24));
+
+        let image_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
+        let max_size = egui::vec2(screen.width() * 0.62, screen.height() * 0.68);
+        let scale = (max_size.x / image_size.x)
+            .min(max_size.y / image_size.y)
+            .min(1.0);
+        let image_rect = egui::Rect::from_center_size(
+            screen.center() - egui::vec2(0.0, 12.0),
+            image_size * scale,
+        );
+        painter.image(
+            texture.id(),
+            image_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        painter.text(
+            screen.center_bottom() - egui::vec2(0.0, 28.0),
+            egui::Align2::CENTER_BOTTOM,
+            text(self.language, "loading"),
+            egui::FontId::proportional(16.0),
+            egui::Color32::WHITE,
+        );
+        context.request_repaint_after(Duration::from_millis(16));
+        true
+    }
+
+    fn start_loading_screen(&mut self) {
+        self.loading = Some(LoadingState::new(MIN_RELOAD_LOADING_TIME));
     }
 
     fn persist_settings(&mut self) {
@@ -141,10 +344,12 @@ impl TrackerApp {
             debug_mode: self.debug_mode,
             pause_map_when_unfocused: self.pause_map_when_unfocused,
             resource_filter,
+            selected_resources: self.map.selected_resources(),
             purity_filter,
             only_claimed,
             node_scale: self.map.node_scale(),
             show_grid: self.map.show_grid(),
+            show_annotations: self.map.show_annotations(),
             only_partial,
             show_rails: self.map.show_rails(),
             show_foundations: self.map.show_foundations(),
@@ -172,6 +377,37 @@ impl TrackerApp {
         self.map.set_circles(Vec::new());
         self.map.set_arrows(Vec::new());
         self.map.set_drawing_history(Vec::new());
+        self.map.set_strokes(Vec::new());
+        self.map.set_unclaimed_miner_tier(3);
+        self.map.set_play_duration_in_seconds(0);
+        self.right_panel_open = false;
+        self.right_panel_edge_blocked = true;
+        self.right_panel_generation = self.right_panel_generation.wrapping_add(1);
+        self.status = text(self.language, "no_save").to_owned();
+        self.error = None;
+        Ok(())
+    }
+
+    fn delete_all_smt_notes(&mut self) -> Result<(), String> {
+        let Some(storage) = self.storage.as_mut() else {
+            return Err("Die Anwendung ist nicht initialisiert".to_owned());
+        };
+        storage
+            .delete_all_smt_notes()
+            .map_err(|error| error.to_string())?;
+
+        self.parse_receiver = None;
+        self.map
+            .replace_allocations(&std::collections::BTreeMap::new());
+        self.map.set_resource_order(Vec::new());
+        self.map.set_rectangles(Vec::new());
+        self.map.set_circles(Vec::new());
+        self.map.set_arrows(Vec::new());
+        self.map.set_texts(Vec::new());
+        self.map.set_strokes(Vec::new());
+        self.map.set_drawing_history(Vec::new());
+        self.map
+            .replace_map_layers(Vec::new(), Vec::new(), Vec::new());
         self.map.set_unclaimed_miner_tier(3);
         self.map.set_play_duration_in_seconds(0);
         self.right_panel_open = false;
@@ -218,6 +454,7 @@ impl TrackerApp {
                     arrows,
                     drawing_history,
                     texts,
+                    strokes,
                 ) = self
                     .storage
                     .as_ref()
@@ -231,6 +468,7 @@ impl TrackerApp {
                             storage.active_arrows(),
                             storage.active_drawing_history(),
                             storage.active_texts(),
+                            storage.active_strokes(),
                         )
                     })
                     .unwrap_or_default();
@@ -242,7 +480,9 @@ impl TrackerApp {
                 self.map.set_arrows(arrows);
                 self.map.set_drawing_history(drawing_history);
                 self.map.set_texts(texts);
+                self.map.set_strokes(strokes);
                 self.map.set_play_duration_in_seconds(0);
+                self.start_loading_screen();
                 self.start_parse(path);
             }
             Err(error) => self.error = Some(error.to_string()),
@@ -250,6 +490,7 @@ impl TrackerApp {
     }
 
     fn refresh_save(&mut self) {
+        self.start_loading_screen();
         let result = match self.storage.as_mut() {
             Some(storage) => storage.refresh(),
             None => return,
@@ -354,6 +595,10 @@ impl eframe::App for TrackerApp {
             context.request_repaint_after(repaint_delay);
         }
 
+        if self.show_startup_loading(context) {
+            return;
+        }
+
         egui::TopBottomPanel::top("toolbar").show(context, |ui| {
             ui.horizontal(|ui| {
                 if ui.button(text(self.language, "upload_save")).clicked() {
@@ -444,6 +689,17 @@ impl eframe::App for TrackerApp {
                     {
                         settings_changed = true;
                     }
+                    let mut show_annotations = self.map.show_annotations();
+                    if ui
+                        .checkbox(
+                            &mut show_annotations,
+                            text(self.language, "show_annotations"),
+                        )
+                        .changed()
+                    {
+                        self.map.set_show_annotations(show_annotations);
+                        settings_changed = true;
+                    }
                     ui.collapsing("Testing stuff", |ui| {
                         let mut show_rails = self.map.show_rails();
                         if ui
@@ -473,6 +729,15 @@ impl eframe::App for TrackerApp {
                             settings_changed = true;
                         }
                     });
+                    ui.collapsing(text(self.language, "more"), |ui| {
+                        if ui
+                            .button(text(self.language, "delete_all_smt_notes"))
+                            .clicked()
+                        {
+                            self.confirm_delete_all_smt_notes = true;
+                            ui.close_menu();
+                        }
+                    });
                     let mut node_scale = self.map.node_scale();
                     let node_scale_label = format!(
                         "{} {:.0}%",
@@ -488,6 +753,10 @@ impl eframe::App for TrackerApp {
                     }
                     ui.separator();
                     ui.small(text(self.language, "background_throttle"));
+                    if ui.button("CLICK ME").clicked() {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab("https://youtu.be/dQw4w9WgXcQ"));
+                    }
                 });
                 if self.map.take_filter_settings_changed() {
                     settings_changed = true;
@@ -499,6 +768,79 @@ impl eframe::App for TrackerApp {
                 ui.separator();
                 ui.small(format!(
                     "{}: {}",
+                    text(self.language, "playtime"),
+                    format_playtime(self.map.play_duration_in_seconds())
+                ));
+            });
+        });
+
+        if self.confirm_delete_all_smt_notes {
+            let mut delete = false;
+            let mut cancel = false;
+            egui::Window::new(text(self.language, "delete_all_smt_notes_title"))
+                .collapsible(false)
+                .resizable(false)
+                .show(context, |ui| {
+                    ui.label(text(self.language, "delete_all_smt_notes_warning"));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(text(self.language, "delete_all_smt_notes_confirm"))
+                            .clicked()
+                        {
+                            delete = true;
+                        }
+                        if ui.button(text(self.language, "cancel")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            if delete {
+                self.confirm_delete_all_smt_notes = false;
+                if let Err(error) = self.delete_all_smt_notes() {
+                    self.error = Some(error);
+                } else {
+                    context.request_repaint();
+                }
+            } else if cancel {
+                self.confirm_delete_all_smt_notes = false;
+            }
+        }
+
+        let save_path = self
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.state.source_path.as_ref())
+            .cloned();
+        egui::TopBottomPanel::top("save-info-bar").show(context, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let save_name = save_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("—");
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}: {save_name}",
+                        text(self.language, "save_file")
+                    ))
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+                );
+                ui.separator();
+                ui.label(format!(
+                    "{} {} · {} {}",
+                    self.map.nodes.len(),
+                    text(self.language, "resource_nodes"),
+                    self.map.claimed_node_count(),
+                    text(self.language, "claimed_nodes")
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "{}: {} · {}: {} · {}: {}",
+                    text(self.language, "belts_laid"),
+                    format_meters(self.map.belt_length_meters()),
+                    text(self.language, "rails_laid"),
+                    format_meters(self.map.rail_length_meters()),
                     text(self.language, "playtime"),
                     format_playtime(self.map.play_duration_in_seconds())
                 ));
@@ -550,32 +892,6 @@ impl eframe::App for TrackerApp {
                                 context.request_repaint();
                             }
                             ui.separator();
-                            ui.label(format!(
-                                "{} {}",
-                                self.map.nodes.len(),
-                                text(self.language, "resource_nodes")
-                            ));
-                            ui.label(format!(
-                                "{} {}",
-                                self.map.claimed_node_count(),
-                                text(self.language, "claimed_nodes")
-                            ));
-                            ui.separator();
-                            ui.label(format!(
-                                "{}: {}",
-                                text(self.language, "belts_laid"),
-                                format_meters(self.map.belt_length_meters())
-                            ));
-                            ui.label(format!(
-                                "{}: {}",
-                                text(self.language, "rails_laid"),
-                                format_meters(self.map.rail_length_meters())
-                            ));
-                            ui.label(format!(
-                                "{}: {}",
-                                text(self.language, "playtime"),
-                                format_playtime(self.map.play_duration_in_seconds())
-                            ));
                             ui.add_space(8.0);
                             let resource_order_changed = self.map.resource_summary(ui);
                             if resource_order_changed {
@@ -699,6 +1015,36 @@ impl eframe::App for TrackerApp {
                         self.map.toggle_text_tool();
                         context.request_repaint();
                     }
+                    let eraser_label = if self.map.eraser_tool_active() {
+                        text(self.language, "cancel_eraser")
+                    } else {
+                        text(self.language, "draw_eraser")
+                    };
+                    if ui
+                        .add_enabled(
+                            has_source_save,
+                            egui::Button::new(eraser_label).min_size(egui::vec2(110.0, 0.0)),
+                        )
+                        .clicked()
+                    {
+                        self.map.toggle_eraser_tool();
+                        context.request_repaint();
+                    }
+                    let pen_label = if self.map.pen_tool_active() {
+                        text(self.language, "cancel_pen")
+                    } else {
+                        text(self.language, "draw_pen")
+                    };
+                    if ui
+                        .add_enabled(
+                            has_source_save,
+                            egui::Button::new(pen_label).min_size(egui::vec2(100.0, 0.0)),
+                        )
+                        .clicked()
+                    {
+                        self.map.toggle_pen_tool();
+                        context.request_repaint();
+                    }
                 });
             });
             ui.add_space(16.0);
@@ -780,6 +1126,13 @@ impl eframe::App for TrackerApp {
             if let Some(texts) = self.map.take_text_save() {
                 if let Some(storage) = self.storage.as_mut() {
                     if let Err(error) = storage.save_active_texts(texts) {
+                        self.error = Some(error.to_string());
+                    }
+                }
+            }
+            if let Some(strokes) = self.map.take_stroke_save() {
+                if let Some(storage) = self.storage.as_mut() {
+                    if let Err(error) = storage.save_active_strokes(strokes) {
                         self.error = Some(error.to_string());
                     }
                 }
@@ -965,4 +1318,26 @@ fn format_playtime(seconds: u32) -> String {
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
     format!("{hours}h {minutes}min")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LOADING_GIFS;
+    use image::AnimationDecoder;
+    use std::io::Cursor;
+
+    #[test]
+    fn bundled_loading_gifs_are_animated() {
+        for gif in LOADING_GIFS {
+            let frames = image::codecs::gif::GifDecoder::new(Cursor::new(gif))
+                .expect("bundled loading GIF should decode")
+                .into_frames()
+                .collect_frames()
+                .expect("bundled loading GIF frames should decode");
+            assert!(
+                frames.len() > 1,
+                "loading asset must contain multiple frames"
+            );
+        }
+    }
 }

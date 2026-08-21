@@ -40,10 +40,6 @@ pub struct ResourceNode {
 }
 
 impl ResourceNode {
-    pub fn remaining_per_minute(&self) -> f32 {
-        (self.capacity_per_minute - self.used_per_minute).max(0.0)
-    }
-
     pub fn utilization(&self) -> f32 {
         if self.capacity_per_minute <= 0.0 {
             0.0
@@ -78,7 +74,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             capacity_per_minute: 600.0,
             used_per_minute: 500.0,
             usage_overridden: false,
-            note: "Demo-Datensatz".into(),
+            note: "Something important goes here...".into(),
             extractor_instance: None,
             extractor_kind: None,
             extraction_method: ExtractionMethod::Miner,
@@ -96,7 +92,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             capacity_per_minute: 780.0,
             used_per_minute: 0.0,
             usage_overridden: false,
-            note: "Demo-Datensatz".into(),
+            note: "Something important goes here...".into(),
             extractor_instance: None,
             extractor_kind: None,
             extraction_method: ExtractionMethod::Miner,
@@ -114,7 +110,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             capacity_per_minute: 600.0,
             used_per_minute: 300.0,
             usage_overridden: false,
-            note: "Demo-Datensatz".into(),
+            note: "Something important goes here...".into(),
             extractor_instance: None,
             extractor_kind: None,
             extraction_method: ExtractionMethod::Miner,
@@ -132,7 +128,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             capacity_per_minute: 300.0,
             used_per_minute: 0.0,
             usage_overridden: false,
-            note: "Demo-Datensatz".into(),
+            note: "Something important goes here...".into(),
             extractor_instance: None,
             extractor_kind: None,
             extraction_method: ExtractionMethod::Miner,
@@ -150,7 +146,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             capacity_per_minute: 300.0,
             used_per_minute: 250.0,
             usage_overridden: false,
-            note: "Demo-Datensatz".into(),
+            note: "Something important goes here...".into(),
             extractor_instance: None,
             extractor_kind: None,
             extraction_method: ExtractionMethod::Miner,
@@ -217,7 +213,7 @@ impl ResourceNode {
             capacity_per_minute: 0.0,
             used_per_minute: 0.0,
             usage_overridden: false,
-            note: format!("Weltobjekt: {}", node.node_type),
+            note: "Something important goes here...".into(),
             extractor_instance: None,
             extractor_kind: None,
             extraction_method,

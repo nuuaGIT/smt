@@ -8,7 +8,7 @@
     "world_z": 0.0,
     "capacity_per_minute": 600.0,
     "used_per_minute": 500.0,
-    "note": "Demo-Datensatz"
+    "note": "Something important goes here..."
   },
   {
     "id": "demo-iron-002",
@@ -19,7 +19,7 @@
     "world_z": 0.0,
     "capacity_per_minute": 780.0,
     "used_per_minute": 0.0,
-    "note": "Demo-Datensatz"
+    "note": "Something important goes here..."
   },
   {
     "id": "demo-coal-001",
@@ -30,7 +30,7 @@
     "world_z": 0.0,
     "capacity_per_minute": 600.0,
     "used_per_minute": 300.0,
-    "note": "Demo-Datensatz"
+    "note": "Something important goes here..."
   },
   {
     "id": "demo-copper-001",
@@ -41,7 +41,7 @@
     "world_z": 0.0,
     "capacity_per_minute": 300.0,
     "used_per_minute": 0.0,
-    "note": "Demo-Datensatz"
+    "note": "Something important goes here..."
   },
   {
     "id": "demo-oil-001",
@@ -52,6 +52,6 @@
     "world_z": 0.0,
     "capacity_per_minute": 300.0,
     "used_per_minute": 250.0,
-    "note": "Demo-Datensatz"
+    "note": "Something important goes here..."
   }
 ]

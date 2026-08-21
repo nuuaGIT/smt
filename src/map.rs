@@ -3,7 +3,8 @@ use crate::save_parser::{
     ParsedBeltSegment, ParsedExtractor, ParsedFoundation, ParsedRailPoint, ParsedRailSegment,
 };
 use crate::storage::{
-    Language, MapAnnotation, MapArrow, MapCircle, MapRectangle, MapText, NodeAllocation,
+    Language, MapAnnotation, MapArrow, MapCircle, MapRectangle, MapStroke, MapStrokeErase, MapText,
+    NodeAllocation,
 };
 use crate::world_data::{ExtractionMethod, ResourceNode};
 use eframe::egui;
@@ -21,6 +22,7 @@ const GRID_WORLD_CHUNK_SIZE: f32 = 20_000.0;
 const MAX_VISIBLE_GRID_LINES: usize = 128;
 const RESOURCE_WELL_MAX_DISTANCE: f32 = 18_000.0;
 const WORLD_UNITS_PER_METER: f32 = 100.0;
+const FREEHAND_ERASER_RADIUS_WORLD: f32 = 5_000.0;
 const FOUNDATION_COORDINATE_SCALE: f32 = 100.0;
 const FOUNDATION_FILL_STEP: f32 = 6.0;
 const FOUNDATION_STRIPE_SPACING: f32 = 18.0;
@@ -32,6 +34,16 @@ enum MovingAnnotation {
     Circle(usize),
     Arrow(usize),
     Text(usize),
+}
+
+#[derive(Clone, Copy)]
+enum DrawingToolIcon {
+    Rectangle,
+    Circle,
+    Arrow,
+    Text,
+    Pen,
+    Eraser,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -50,6 +62,31 @@ struct FoundationCluster {
     max_y: f32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct RenderViewKey {
+    rect_min_x: f32,
+    rect_min_y: f32,
+    rect_max_x: f32,
+    rect_max_y: f32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    data_generation: u64,
+}
+
+struct FoundationRenderCache {
+    key: RenderViewKey,
+    contours: Vec<Vec<egui::Pos2>>,
+    fill_mesh: egui::Mesh,
+    outline_mesh: egui::Mesh,
+}
+
+struct SplineRenderCache {
+    key: RenderViewKey,
+    underlay_mesh: egui::Mesh,
+    overlay_mesh: egui::Mesh,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ResourceSummary {
     total_per_minute: f32,
@@ -63,6 +100,10 @@ pub struct MapView {
     pub nodes: Vec<ResourceNode>,
     rails: Vec<ParsedRailSegment>,
     foundation_clusters: Vec<FoundationCluster>,
+    layer_data_generation: u64,
+    foundation_render_cache: Option<FoundationRenderCache>,
+    rail_render_cache: Option<SplineRenderCache>,
+    belt_render_cache: Option<SplineRenderCache>,
     foundation_instance_count: usize,
     belts: Vec<ParsedBeltSegment>,
     rail_length_meters: f32,
@@ -82,6 +123,7 @@ pub struct MapView {
     filter_settings_dirty: bool,
     node_scale: f32,
     show_grid: bool,
+    show_annotations: bool,
     show_rails: bool,
     show_foundations: bool,
     show_belts: bool,
@@ -90,6 +132,7 @@ pub struct MapView {
     resource_summary_cache: std::collections::BTreeMap<String, ResourceSummary>,
     resource_summary_dirty: bool,
     resource_filter: String,
+    selected_resources: Option<BTreeSet<String>>,
     purity_filter: String,
     only_used: bool,
     only_partial: bool,
@@ -98,10 +141,13 @@ pub struct MapView {
     circles: Vec<MapCircle>,
     arrows: Vec<MapArrow>,
     texts: Vec<MapText>,
+    strokes: Vec<MapStroke>,
     rectangle_tool_active: bool,
     circle_tool_active: bool,
     arrow_tool_active: bool,
     text_tool_active: bool,
+    pen_tool_active: bool,
+    eraser_tool_active: bool,
     rectangle_start_world: Option<egui::Vec2>,
     rectangle_preview_end_world: Option<egui::Vec2>,
     rectangle_save_requested: bool,
@@ -121,6 +167,8 @@ pub struct MapView {
     text_edit_buffer: String,
     drawing_history: Vec<MapAnnotation>,
     drawing_history_save_requested: bool,
+    stroke_save_requested: bool,
+    freehand_current_stroke: Option<Vec<[f32; 2]>>,
 }
 
 impl Default for MapView {
@@ -130,6 +178,10 @@ impl Default for MapView {
             nodes,
             rails: Vec::new(),
             foundation_clusters: Vec::new(),
+            layer_data_generation: 0,
+            foundation_render_cache: None,
+            rail_render_cache: None,
+            belt_render_cache: None,
             foundation_instance_count: 0,
             belts: Vec::new(),
             rail_length_meters: 0.0,
@@ -149,6 +201,7 @@ impl Default for MapView {
             filter_settings_dirty: false,
             node_scale: 1.0,
             show_grid: false,
+            show_annotations: true,
             show_rails: false,
             show_foundations: false,
             show_belts: false,
@@ -157,6 +210,7 @@ impl Default for MapView {
             resource_summary_cache: std::collections::BTreeMap::new(),
             resource_summary_dirty: true,
             resource_filter: ALL_RESOURCES_FILTER.into(),
+            selected_resources: None,
             purity_filter: ALL_PURITY_FILTER.into(),
             only_used: false,
             only_partial: false,
@@ -165,10 +219,13 @@ impl Default for MapView {
             circles: Vec::new(),
             arrows: Vec::new(),
             texts: Vec::new(),
+            strokes: Vec::new(),
             rectangle_tool_active: false,
             circle_tool_active: false,
             arrow_tool_active: false,
             text_tool_active: false,
+            pen_tool_active: false,
+            eraser_tool_active: false,
             rectangle_start_world: None,
             rectangle_preview_end_world: None,
             rectangle_save_requested: false,
@@ -188,6 +245,8 @@ impl Default for MapView {
             text_edit_buffer: String::new(),
             drawing_history: Vec::new(),
             drawing_history_save_requested: false,
+            stroke_save_requested: false,
+            freehand_current_stroke: None,
         }
     }
 }
@@ -211,6 +270,14 @@ impl MapView {
 
     pub fn text_tool_active(&self) -> bool {
         self.text_tool_active
+    }
+
+    pub fn pen_tool_active(&self) -> bool {
+        self.pen_tool_active
+    }
+
+    pub fn eraser_tool_active(&self) -> bool {
+        self.eraser_tool_active
     }
 
     pub fn toggle_rectangle_tool(&mut self) {
@@ -263,6 +330,24 @@ impl MapView {
         }
     }
 
+    pub fn toggle_pen_tool(&mut self) {
+        if self.pen_tool_active {
+            self.cancel_drawing_tools();
+        } else {
+            self.cancel_drawing_tools();
+            self.pen_tool_active = true;
+        }
+    }
+
+    pub fn toggle_eraser_tool(&mut self) {
+        if self.eraser_tool_active {
+            self.cancel_drawing_tools();
+        } else {
+            self.cancel_drawing_tools();
+            self.eraser_tool_active = true;
+        }
+    }
+
     fn commit_text_edit(&mut self) {
         let Some(position) = self.text_edit_world.take() else {
             return;
@@ -292,12 +377,37 @@ impl MapView {
         self.circle_tool_active = false;
         self.arrow_tool_active = false;
         self.text_tool_active = false;
+        self.pen_tool_active = false;
+        self.eraser_tool_active = false;
+        self.freehand_current_stroke = None;
         self.text_edit_world = None;
         self.text_edit_buffer.clear();
     }
 
     fn drawing_tool_active(&self) -> bool {
-        self.rectangle_tool_active || self.circle_tool_active || self.arrow_tool_active
+        self.rectangle_tool_active
+            || self.circle_tool_active
+            || self.arrow_tool_active
+            || self.pen_tool_active
+            || self.eraser_tool_active
+    }
+
+    fn active_drawing_tool_icon(&self) -> Option<DrawingToolIcon> {
+        if self.rectangle_tool_active {
+            Some(DrawingToolIcon::Rectangle)
+        } else if self.circle_tool_active {
+            Some(DrawingToolIcon::Circle)
+        } else if self.arrow_tool_active {
+            Some(DrawingToolIcon::Arrow)
+        } else if self.text_tool_active {
+            Some(DrawingToolIcon::Text)
+        } else if self.pen_tool_active {
+            Some(DrawingToolIcon::Pen)
+        } else if self.eraser_tool_active {
+            Some(DrawingToolIcon::Eraser)
+        } else {
+            None
+        }
     }
 
     pub fn cancel_rectangle_tool(&mut self) {
@@ -344,6 +454,14 @@ impl MapView {
         self.text_edit_buffer.clear();
         self.moving_annotation = None;
         self.annotation_move_offset = None;
+    }
+
+    pub fn set_strokes(&mut self, strokes: Vec<MapStroke>) {
+        self.strokes = strokes;
+        self.stroke_save_requested = false;
+        self.freehand_current_stroke = None;
+        self.pen_tool_active = false;
+        self.eraser_tool_active = false;
     }
 
     pub fn set_drawing_history(&mut self, history: Vec<MapAnnotation>) {
@@ -458,6 +576,14 @@ impl MapView {
         Some(self.texts.clone())
     }
 
+    pub fn take_stroke_save(&mut self) -> Option<Vec<MapStroke>> {
+        if !self.stroke_save_requested {
+            return None;
+        }
+        self.stroke_save_requested = false;
+        Some(self.strokes.clone())
+    }
+
     pub fn take_drawing_history_save(&mut self) -> Option<Vec<MapAnnotation>> {
         if !self.drawing_history_save_requested {
             return None;
@@ -467,8 +593,14 @@ impl MapView {
     }
 
     pub fn undo_last_rectangle(&mut self) -> bool {
-        if self.drawing_tool_active() {
-            self.cancel_rectangle_tool();
+        if self.freehand_current_stroke.is_some()
+            || self.rectangle_tool_active
+            || self.circle_tool_active
+            || self.arrow_tool_active
+        {
+            self.cancel_drawing_tools();
+            self.rectangle_start_world = None;
+            self.rectangle_preview_end_world = None;
             return true;
         }
         if let Some(annotation) = self.drawing_history.pop() {
@@ -509,6 +641,38 @@ impl MapView {
                         self.texts.remove(index);
                         self.text_save_requested = true;
                     }
+                }
+                MapAnnotation::Stroke(stroke) => {
+                    if let Some(index) = self
+                        .strokes
+                        .iter()
+                        .rposition(|candidate| *candidate == stroke)
+                    {
+                        self.strokes.remove(index);
+                        self.stroke_save_requested = true;
+                    } else {
+                        self.strokes.push(stroke);
+                        self.stroke_save_requested = true;
+                    }
+                }
+                MapAnnotation::StrokeErase(operation) => {
+                    for replacement in operation.replacement {
+                        if let Some(index) = self
+                            .strokes
+                            .iter()
+                            .rposition(|candidate| *candidate == replacement)
+                        {
+                            self.strokes.remove(index);
+                        }
+                    }
+                    if !self
+                        .strokes
+                        .iter()
+                        .any(|candidate| *candidate == operation.original)
+                    {
+                        self.strokes.push(operation.original);
+                    }
+                    self.stroke_save_requested = true;
                 }
             }
             self.drawing_history_save_requested = true;
@@ -551,6 +715,25 @@ impl MapView {
 
     pub fn set_show_grid(&mut self, show: bool) {
         self.show_grid = show;
+    }
+
+    pub fn show_annotations(&self) -> bool {
+        self.show_annotations
+    }
+
+    pub fn set_show_annotations(&mut self, show: bool) {
+        self.show_annotations = show;
+        if !show {
+            self.cancel_drawing_tools();
+            self.selected_rectangle = None;
+            self.selected_circle = None;
+            self.selected_arrow = None;
+            self.selected_text = None;
+            self.rectangle_popup_position = None;
+            self.moving_rectangle = None;
+            self.moving_annotation = None;
+            self.annotation_move_offset = None;
+        }
     }
 
     pub fn show_rails(&self) -> bool {
@@ -606,6 +789,12 @@ impl MapView {
         )
     }
 
+    pub fn selected_resources(&self) -> Option<Vec<String>> {
+        self.selected_resources
+            .as_ref()
+            .map(|resources| resources.iter().cloned().collect())
+    }
+
     pub fn set_filter_settings(
         &mut self,
         resource_filter: String,
@@ -614,9 +803,30 @@ impl MapView {
         only_partial: bool,
     ) {
         self.resource_filter = normalize_resource_filter(&resource_filter);
+        self.selected_resources = if self.resource_filter == ALL_RESOURCES_FILTER {
+            None
+        } else {
+            Some(std::iter::once(self.resource_filter.clone()).collect())
+        };
         self.purity_filter = normalize_purity_filter(&purity_filter);
         self.only_used = only_claimed;
         self.only_partial = only_partial;
+    }
+
+    pub fn set_selected_resources(&mut self, resources: Option<Vec<String>>) {
+        self.selected_resources = resources.map(|resources| resources.into_iter().collect());
+        self.sync_legacy_resource_filter();
+    }
+
+    fn sync_legacy_resource_filter(&mut self) {
+        self.resource_filter = match &self.selected_resources {
+            None => ALL_RESOURCES_FILTER.to_owned(),
+            Some(resources) if resources.len() == 1 => resources
+                .first()
+                .cloned()
+                .unwrap_or_else(|| ALL_RESOURCES_FILTER.to_owned()),
+            Some(_) => ALL_RESOURCES_FILTER.to_owned(),
+        };
     }
 
     pub fn take_filter_settings_changed(&mut self) -> bool {
@@ -691,7 +901,7 @@ impl MapView {
             self.resource_summary_dirty = false;
         }
 
-        let summaries = self.resource_summary_cache.clone();
+        let summaries = &self.resource_summary_cache;
 
         ui.heading(text(self.language, "resource_remaining"));
         if summaries.is_empty() {
@@ -711,7 +921,9 @@ impl MapView {
             }
         }
         let mut order_changed = ordered_resources != self.resource_order;
-        self.resource_order = ordered_resources.clone();
+        if order_changed {
+            self.resource_order = ordered_resources.clone();
+        }
 
         let total_capacity: f32 = summaries
             .values()
@@ -736,8 +948,8 @@ impl MapView {
         ui.add_space(6.0);
 
         let mut pending_drop = None;
-        for resource in ordered_resources {
-            let Some(summary) = summaries.get(&resource) else {
+        for resource in &ordered_resources {
+            let Some(summary) = summaries.get(resource) else {
                 continue;
             };
             let fraction = if summary.total_per_minute > 0.0 {
@@ -748,7 +960,7 @@ impl MapView {
             let low_remaining = summary.remaining_per_minute <= 500.0;
             let color = self
                 .resource_icon_colors
-                .get(&resource)
+                .get(resource)
                 .copied()
                 .unwrap_or_else(|| egui::Color32::from_rgb(0xB9, 0xC2, 0xC6));
 
@@ -768,7 +980,7 @@ impl MapView {
                             |ui| {
                                 ui.horizontal(|ui| {
                                     ui.small("↕");
-                                    if let Some(icon) = self.resource_icons.get(&resource) {
+                                    if let Some(icon) = self.resource_icons.get(resource) {
                                         ui.add(
                                             egui::Image::from_texture(icon)
                                                 .fit_to_exact_size(egui::vec2(28.0, 28.0)),
@@ -783,22 +995,29 @@ impl MapView {
                                         egui::vec2(content_width, 50.0),
                                         egui::Layout::top_down(egui::Align::Min),
                                         |ui| {
-                                            ui.label(&resource);
-                                            ui.add(
-                                                egui::ProgressBar::new(fraction)
-                                                    .fill(color)
-                                                    .desired_width(content_width)
-                                                    .text(format!(
-                                                        "{} / {} {}",
-                                                        format_resource_amount(
-                                                            summary.remaining_per_minute
-                                                        ),
-                                                        format_resource_amount(
-                                                            summary.total_per_minute
-                                                        ),
-                                                        text(self.language, "remaining_short")
-                                                    )),
+                                            ui.label(
+                                                egui::RichText::new(resource)
+                                                    .color(egui::Color32::WHITE),
                                             );
+                                            ui.scope(|ui| {
+                                                ui.visuals_mut().selection.stroke.color =
+                                                    egui::Color32::WHITE;
+                                                ui.add(
+                                                    egui::ProgressBar::new(fraction)
+                                                        .fill(color)
+                                                        .desired_width(content_width)
+                                                        .text(format!(
+                                                            "{} / {} {}",
+                                                            format_resource_amount(
+                                                                summary.remaining_per_minute
+                                                            ),
+                                                            format_resource_amount(
+                                                                summary.total_per_minute
+                                                            ),
+                                                            text(self.language, "remaining_short")
+                                                        )),
+                                                );
+                                            });
                                             ui.small(format!(
                                                 "{} {} {}",
                                                 summary.partially_used_nodes,
@@ -822,7 +1041,7 @@ impl MapView {
                     });
             });
             if let Some(payload) = dropped {
-                if payload.as_str() != resource {
+                if payload.as_str() != resource.as_str() {
                     pending_drop = Some((payload.to_string(), resource.clone()));
                 }
             }
@@ -855,6 +1074,10 @@ impl MapView {
     ) {
         self.foundation_instance_count = foundations.len();
         self.foundation_clusters = build_foundation_clusters(&foundations);
+        self.layer_data_generation = self.layer_data_generation.wrapping_add(1);
+        self.foundation_render_cache = None;
+        self.rail_render_cache = None;
+        self.belt_render_cache = None;
         self.rail_length_meters = rail_segments_length_meters(&rails);
         self.belt_length_meters = belt_segments_length_meters(&belts);
         self.rails = rails;
@@ -903,6 +1126,10 @@ impl MapView {
         }
         self.rails.clear();
         self.foundation_clusters.clear();
+        self.layer_data_generation = self.layer_data_generation.wrapping_add(1);
+        self.foundation_render_cache = None;
+        self.rail_render_cache = None;
+        self.belt_render_cache = None;
         self.foundation_instance_count = 0;
         self.belts.clear();
         self.rail_length_meters = 0.0;
@@ -996,6 +1223,7 @@ impl MapView {
 
     pub fn filters(&mut self, ui: &mut egui::Ui) {
         let previous_settings = self.filter_settings();
+        let previous_resource_selection = self.selected_resources.clone();
         let previous_grid = self.show_grid;
         ui.heading(text(self.language, "resource_nodes"));
         ui.label(format!(
@@ -1006,23 +1234,75 @@ impl MapView {
         ui.add_space(8.0);
 
         let resources = self.resource_options();
-        let selected_resource = if self.resource_filter == ALL_RESOURCES_FILTER {
-            text(self.language, "all_resources")
+        let selected_resource_count = self
+            .selected_resources
+            .as_ref()
+            .map(|selected| {
+                resources
+                    .iter()
+                    .filter(|resource| selected.contains(*resource))
+                    .count()
+            })
+            .unwrap_or(resources.len());
+        let selected_resource = if selected_resource_count == resources.len() {
+            text(self.language, "all_resources").to_owned()
+        } else if selected_resource_count == 0 {
+            text(self.language, "no_resources_selected").to_owned()
         } else {
-            &self.resource_filter
+            format!(
+                "{} / {} {}",
+                selected_resource_count,
+                resources.len(),
+                text(self.language, "resources_selected")
+            )
         };
-        egui::ComboBox::from_label(text(self.language, "resource"))
-            .selected_text(selected_resource)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.resource_filter,
-                    ALL_RESOURCES_FILTER.into(),
-                    text(self.language, "all_resources"),
-                );
-                for resource in resources {
-                    ui.selectable_value(&mut self.resource_filter, resource.clone(), resource);
-                }
-            });
+        ui.horizontal(|ui| {
+            ui.label(text(self.language, "resource"));
+            let resource_popup_id = ui.make_persistent_id("resource-filter-popup");
+            let resource_button = ui.button(selected_resource);
+            if resource_button.clicked() {
+                ui.memory_mut(|memory| memory.toggle_popup(resource_popup_id));
+            }
+            egui::popup::popup_below_widget(
+                ui,
+                resource_popup_id,
+                &resource_button,
+                egui::PopupCloseBehavior::CloseOnClickOutside,
+                |ui| {
+                    ui.set_min_width(resource_button.rect.width().max(260.0));
+                    ui.horizontal(|ui| {
+                        if ui.button(text(self.language, "activate_all")).clicked() {
+                            self.selected_resources = None;
+                            self.sync_legacy_resource_filter();
+                        }
+                        if ui.button(text(self.language, "deactivate_all")).clicked() {
+                            self.selected_resources = Some(BTreeSet::new());
+                            self.sync_legacy_resource_filter();
+                        }
+                    });
+                    ui.separator();
+                    for resource in &resources {
+                        let mut selected = self
+                            .selected_resources
+                            .as_ref()
+                            .is_none_or(|selected| selected.contains(resource));
+                        if ui.checkbox(&mut selected, resource).changed() {
+                            let mut selected_resources = self
+                                .selected_resources
+                                .clone()
+                                .unwrap_or_else(|| resources.iter().cloned().collect());
+                            if selected {
+                                selected_resources.insert(resource.clone());
+                            } else {
+                                selected_resources.remove(resource);
+                            }
+                            self.selected_resources = Some(selected_resources);
+                            self.sync_legacy_resource_filter();
+                        }
+                    }
+                },
+            );
+        });
 
         let selected_purity = if self.purity_filter == ALL_PURITY_FILTER {
             text(self.language, "all_purities")
@@ -1045,7 +1325,10 @@ impl MapView {
         ui.checkbox(&mut self.only_used, text(self.language, "claimed_only"));
         ui.checkbox(&mut self.only_partial, text(self.language, "partial_only"));
         ui.checkbox(&mut self.show_grid, text(self.language, "grid"));
-        if previous_settings != self.filter_settings() || previous_grid != self.show_grid {
+        if previous_settings != self.filter_settings()
+            || previous_resource_selection != self.selected_resources
+            || previous_grid != self.show_grid
+        {
             self.filter_settings_dirty = true;
         }
         ui.add_space(12.0);
@@ -1053,10 +1336,12 @@ impl MapView {
         ui.small(text(self.language, "world_data_hint"));
     }
 
+    pub fn prepare_assets(&mut self, context: &egui::Context) {
+        self.ensure_background(context);
+        self.ensure_resource_icons(context);
+    }
+
     pub fn canvas(&mut self, ui: &mut egui::Ui) {
-        for node in &mut self.nodes {
-            node.clamp_usage_to_capacity();
-        }
         self.ensure_background(ui.ctx());
         self.ensure_resource_icons(ui.ctx());
 
@@ -1091,61 +1376,109 @@ impl MapView {
         let drawing_tool_was_active = self.drawing_tool_active();
         let text_tool_was_active = self.text_tool_active;
         if drawing_tool_was_active {
-            if response.drag_started() {
-                self.rectangle_start_world = response
-                    .interact_pointer_pos()
-                    .map(|position| self.world_at_screen(rect, position));
-                self.rectangle_preview_end_world = self.rectangle_start_world;
-            }
-            if self.rectangle_start_world.is_some() && response.dragged() {
-                self.rectangle_preview_end_world = response
-                    .interact_pointer_pos()
-                    .map(|position| self.world_at_screen(rect, position));
-                ui.ctx().request_repaint();
-            }
-            if response.drag_stopped() {
-                if let (Some(start), Some(end)) = (
-                    self.rectangle_start_world,
-                    self.rectangle_preview_end_world.or_else(|| {
-                        response
-                            .interact_pointer_pos()
-                            .map(|position| self.world_at_screen(rect, position))
-                    }),
-                ) {
-                    if self.rectangle_tool_active {
-                        let rectangle = normalize_rectangle(start, end);
-                        if (rectangle.max_world_x - rectangle.min_world_x).abs() > 1.0
-                            && (rectangle.max_world_y - rectangle.min_world_y).abs() > 1.0
-                        {
-                            self.rectangles.push(rectangle);
-                            self.rectangle_save_requested = true;
-                            self.record_drawing(MapAnnotation::Rectangle(rectangle));
+            if self.pen_tool_active || self.eraser_tool_active {
+                if response.drag_started() {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        if self.pen_tool_active {
+                            let world = self.world_at_screen(rect, pointer);
+                            self.freehand_current_stroke = Some(vec![[world.x, world.y]]);
+                        } else {
+                            self.erase_strokes_at(rect, pointer);
                         }
-                    } else if self.circle_tool_active {
-                        let radius = (end - start).length();
-                        if radius > 1.0 {
-                            self.circles.push(MapCircle {
-                                center_world_x: start.x,
-                                center_world_y: start.y,
-                                radius_world: radius,
-                            });
-                            self.circle_save_requested = true;
-                            self.record_drawing(MapAnnotation::Circle(
-                                *self.circles.last().unwrap(),
-                            ));
-                        }
-                    } else if self.arrow_tool_active && (end - start).length() > 1.0 {
-                        self.arrows.push(MapArrow {
-                            start_world_x: start.x,
-                            start_world_y: start.y,
-                            end_world_x: end.x,
-                            end_world_y: end.y,
-                        });
-                        self.arrow_save_requested = true;
-                        self.record_drawing(MapAnnotation::Arrow(*self.arrows.last().unwrap()));
                     }
                 }
-                self.cancel_rectangle_tool();
+                if response.dragged() {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        if self.pen_tool_active {
+                            let world = self.world_at_screen(rect, pointer);
+                            let should_push = match self
+                                .freehand_current_stroke
+                                .as_ref()
+                                .and_then(|points| points.last().copied())
+                            {
+                                Some(last) => {
+                                    self.to_screen(rect, last[0], last[1]).distance(pointer) >= 1.5
+                                }
+                                None => true,
+                            };
+                            if should_push {
+                                if let Some(points) = self.freehand_current_stroke.as_mut() {
+                                    points.push([world.x, world.y]);
+                                }
+                            }
+                        } else {
+                            self.erase_strokes_at(rect, pointer);
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                }
+                if self.pen_tool_active && response.drag_stopped() {
+                    if let Some(points) = self.freehand_current_stroke.take() {
+                        if points.len() >= 2 {
+                            let stroke = MapStroke { points };
+                            self.strokes.push(stroke.clone());
+                            self.stroke_save_requested = true;
+                            self.record_drawing(MapAnnotation::Stroke(stroke));
+                        }
+                    }
+                }
+            } else {
+                if response.drag_started() {
+                    self.rectangle_start_world = response
+                        .interact_pointer_pos()
+                        .map(|position| self.world_at_screen(rect, position));
+                    self.rectangle_preview_end_world = self.rectangle_start_world;
+                }
+                if self.rectangle_start_world.is_some() && response.dragged() {
+                    self.rectangle_preview_end_world = response
+                        .interact_pointer_pos()
+                        .map(|position| self.world_at_screen(rect, position));
+                    ui.ctx().request_repaint();
+                }
+                if response.drag_stopped() {
+                    if let (Some(start), Some(end)) = (
+                        self.rectangle_start_world,
+                        self.rectangle_preview_end_world.or_else(|| {
+                            response
+                                .interact_pointer_pos()
+                                .map(|position| self.world_at_screen(rect, position))
+                        }),
+                    ) {
+                        if self.rectangle_tool_active {
+                            let rectangle = normalize_rectangle(start, end);
+                            if (rectangle.max_world_x - rectangle.min_world_x).abs() > 1.0
+                                && (rectangle.max_world_y - rectangle.min_world_y).abs() > 1.0
+                            {
+                                self.rectangles.push(rectangle);
+                                self.rectangle_save_requested = true;
+                                self.record_drawing(MapAnnotation::Rectangle(rectangle));
+                            }
+                        } else if self.circle_tool_active {
+                            let radius = (end - start).length();
+                            if radius > 1.0 {
+                                self.circles.push(MapCircle {
+                                    center_world_x: start.x,
+                                    center_world_y: start.y,
+                                    radius_world: radius,
+                                });
+                                self.circle_save_requested = true;
+                                self.record_drawing(MapAnnotation::Circle(
+                                    *self.circles.last().unwrap(),
+                                ));
+                            }
+                        } else if self.arrow_tool_active && (end - start).length() > 1.0 {
+                            self.arrows.push(MapArrow {
+                                start_world_x: start.x,
+                                start_world_y: start.y,
+                                end_world_x: end.x,
+                                end_world_y: end.y,
+                            });
+                            self.arrow_save_requested = true;
+                            self.record_drawing(MapAnnotation::Arrow(*self.arrows.last().unwrap()));
+                        }
+                    }
+                    self.cancel_rectangle_tool();
+                }
             }
         } else if let Some(index) = self.moving_rectangle {
             if response.drag_started() {
@@ -1280,14 +1613,17 @@ impl MapView {
         if self.show_rails {
             self.draw_rails(&painter, rect);
         }
-        self.draw_rectangles(&painter, rect);
-        self.draw_circles(&painter, rect);
-        self.draw_arrows(&painter, rect);
-        self.draw_texts(&painter, rect);
+        if self.show_annotations {
+            self.draw_strokes(&painter, rect, response.hover_pos());
+            self.draw_rectangles(&painter, rect);
+            self.draw_circles(&painter, rect);
+            self.draw_arrows(&painter, rect);
+        }
         self.draw_resource_well_links(&painter, rect);
 
         let mut rectangle_context_opened = false;
-        if !drawing_tool_was_active
+        if self.show_annotations
+            && !drawing_tool_was_active
             && !text_tool_was_active
             && self.moving_rectangle.is_none()
             && self.moving_annotation.is_none()
@@ -1323,7 +1659,8 @@ impl MapView {
             }
         }
 
-        if !drawing_tool_was_active
+        if self.show_annotations
+            && !drawing_tool_was_active
             && self.moving_rectangle.is_none()
             && self.moving_annotation.is_none()
         {
@@ -1393,10 +1730,10 @@ impl MapView {
         }
 
         let mut clicked_node = None;
+        let radius = (6.0 * self.zoom.sqrt() * 1.5 * self.node_scale)
+            .clamp(7.5 * self.node_scale, 21.0 * self.node_scale);
         for node in self.visible_nodes() {
             let position = self.to_screen(rect, node.world_x, node.world_y);
-            let radius = (6.0 * self.zoom.sqrt() * 1.5 * self.node_scale)
-                .clamp(7.5 * self.node_scale, 21.0 * self.node_scale);
             let marker_id = egui::Id::new(("resource-node", node.id.as_str()));
             let marker_rect = egui::Rect::from_center_size(
                 position,
@@ -1406,13 +1743,15 @@ impl MapView {
                 continue;
             }
             let marker_response = ui.interact(marker_rect, marker_id, egui::Sense::click());
+            let hover_active = marker_response.hovered() && self.selected_id.is_none();
             let hover_progress = ui.ctx().animate_bool_with_time(
                 egui::Id::new(("resource-node-hover", node.id.as_str())),
-                marker_response.hovered(),
+                hover_active,
                 0.12,
             );
-            if hover_progress < 0.999 || marker_response.hovered() {
-                ui.ctx().request_repaint();
+            if hover_progress < 0.999 {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
             }
             let visual_radius = radius + hover_progress * 1.8;
 
@@ -1441,13 +1780,14 @@ impl MapView {
                 }
             }
 
-            let marker_hovered = marker_response.hovered();
+            let marker_hovered = hover_active;
             let marker_clicked = marker_response.clicked();
-            if marker_hovered {
+            if marker_hovered && self.selected_id.is_none() && !marker_clicked {
                 let well_totals = self.resource_well_totals_for(&node.id);
-                marker_response
-                    .clone()
-                    .on_hover_ui(|ui| node_tooltip(ui, node, well_totals, self.language));
+                let node_icon = self.resource_icons.get(&node.resource).cloned();
+                marker_response.clone().on_hover_ui(|ui| {
+                    node_tooltip(ui, node, well_totals, self.language, node_icon.as_ref())
+                });
             }
 
             if marker_clicked
@@ -1469,6 +1809,12 @@ impl MapView {
             }
         }
 
+        // Text is intentionally rendered after resource nodes so labels stay
+        // readable when their anchor is underneath a node marker.
+        if self.show_annotations {
+            self.draw_texts(&painter, rect);
+        }
+
         let node_was_clicked = clicked_node.is_some();
         if let Some(clicked_id) = clicked_node {
             if self.selected_id.as_deref() != Some(clicked_id.as_str()) {
@@ -1479,11 +1825,22 @@ impl MapView {
             }
         }
 
-        let text_editor_rect = self.draw_text_editor(ui.ctx(), rect);
-        let rectangle_popup_rect = self.draw_selected_rectangle_popup(ui.ctx(), rect);
-        let simple_annotation_popup_rect =
-            self.draw_selected_simple_annotation_popup(ui.ctx(), rect);
-        let popup_rect = self.draw_selected_popup(ui.ctx(), rect);
+        let text_editor_rect = if self.show_annotations {
+            self.draw_text_editor(ui.ctx(), rect)
+        } else {
+            None
+        };
+        let rectangle_popup_rect = if self.show_annotations {
+            self.draw_selected_rectangle_popup(ui.ctx(), rect)
+        } else {
+            None
+        };
+        let simple_annotation_popup_rect = if self.show_annotations {
+            self.draw_selected_simple_annotation_popup(ui.ctx(), rect)
+        } else {
+            None
+        };
+        let popup_rect = self.draw_selected_popup(ui.ctx(), rect, ui.layer_id());
         if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             if self.drawing_tool_active() || self.text_tool_active || self.text_edit_world.is_some()
             {
@@ -1591,6 +1948,14 @@ impl MapView {
             egui::FontId::monospace(12.0),
             egui::Color32::from_gray(210),
         );
+
+        if self.show_annotations {
+            if let (Some(tool), Some(pointer)) =
+                (self.active_drawing_tool_icon(), response.hover_pos())
+            {
+                draw_drawing_tool_cursor(&painter, pointer + egui::vec2(16.0, 16.0), tool);
+            }
+        }
     }
 
     fn draw_selected_rectangle_popup(
@@ -1804,6 +2169,7 @@ impl MapView {
         &mut self,
         context: &egui::Context,
         map_rect: egui::Rect,
+        parent_layer: egui::LayerId,
     ) -> Option<egui::Rect> {
         let selected_id = self.selected_id.clone()?;
         let node_position = self
@@ -1811,33 +2177,29 @@ impl MapView {
             .iter()
             .find(|node| node.id == selected_id)
             .map(|node| self.to_screen(map_rect, node.world_x, node.world_y))?;
+        let node_icon = self
+            .nodes
+            .iter()
+            .find(|node| node.id == selected_id)
+            .and_then(|node| self.resource_icons.get(&node.resource))
+            .cloned();
 
-        let available = context.available_rect();
-        let popup_size = egui::vec2(340.0, 390.0);
-        let popup_progress = context.animate_bool_with_time(
-            egui::Id::new(("node-popup-animation", selected_id.as_str())),
-            true,
-            0.16,
+        let marker_radius = (6.0 * self.zoom.sqrt() * 1.5 * self.node_scale)
+            .clamp(7.5 * self.node_scale, 21.0 * self.node_scale);
+        let marker_rect = egui::Rect::from_center_size(
+            node_position,
+            egui::vec2((marker_radius + 8.0) * 2.0, (marker_radius + 8.0) * 2.0),
         );
-        if popup_progress < 0.999 {
-            context.request_repaint();
-        }
-        let mut popup_position = node_position + egui::vec2(20.0, 20.0);
-        if popup_position.x + popup_size.x > available.right() {
-            popup_position.x = node_position.x - popup_size.x - 20.0;
-        }
-        if popup_position.y + popup_size.y > available.bottom() {
-            popup_position.y = node_position.y - popup_size.y - 20.0;
-        }
-        popup_position.y += (1.0 - popup_progress) * 10.0;
         let well_totals = self.resource_well_totals_for(&selected_id);
 
         let mut changed = false;
         let mut close_requested = false;
-        let inner = egui::Area::new(egui::Id::new("selected-node-popup"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(popup_position)
-            .show(context, |ui| {
+        let popup_rect = egui::show_tooltip_for(
+            context,
+            parent_layer,
+            egui::Id::new(("selected-node-popup", selected_id.as_str())),
+            &marker_rect,
+            |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_min_width(310.0);
                     let Some(node) = self.nodes.iter_mut().find(|node| node.id == selected_id)
@@ -1846,9 +2208,25 @@ impl MapView {
                     };
 
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&node.resource).heading());
+                        if let Some(icon) = &node_icon {
+                            ui.add(
+                                egui::Image::from_texture(icon)
+                                    .fit_to_exact_size(egui::vec2(24.0, 24.0)),
+                            );
+                        }
                         ui.label(
-                            egui::RichText::new(format!("· {}", node.purity))
+                            egui::RichText::new(&node.resource)
+                                .heading()
+                                .color(egui::Color32::WHITE),
+                        );
+                        if node.extractor_instance.is_some() {
+                            let (_, badge_rect) = ui.allocate_space(egui::vec2(16.0, 16.0));
+                            draw_check_badge(ui.painter(), badge_rect.center(), 6.0);
+                        }
+                        ui.label(egui::RichText::new("·").color(ui.visuals().text_color()));
+                        ui.label(
+                            egui::RichText::new(&node.purity)
+                                .strong()
                                 .color(purity_color(node)),
                         );
                         if ui
@@ -1859,60 +2237,63 @@ impl MapView {
                             close_requested = true;
                         }
                     });
-                    node_details(ui, node, self.language);
+                    node_details(ui, node, self.language, false, true);
                     ui.separator();
                     if let Some(totals) = well_totals {
                         show_resource_well_totals(ui, totals, self.language);
                     } else {
                         ui.label(egui::RichText::new(text(self.language, "usage")).strong());
-                        ui.label(format!(
-                            "{}: {:.0} / min",
-                            text(self.language, "maximum_settable"),
-                            node.capacity_per_minute
-                        ));
-                        ui.label(format!(
-                            "{}: {} · Overclock: {:.0}% · Maximum: {:.0}%",
-                            text(self.language, "powershards_clock"),
-                            node.power_shards,
-                            node.current_overclock * 100.0,
-                            node.max_overclock * 100.0
-                        ));
+                        let usage_text = format!(
+                            "{:.0} / {:.0} / min ({:.1}%)",
+                            node.used_per_minute,
+                            node.capacity_per_minute,
+                            node.utilization() * 100.0
+                        );
                         let usage_changed = ui
-                            .add(
-                                egui::DragValue::new(&mut node.used_per_minute)
-                                    .speed(1.0)
-                                    .range(0.0..=node.capacity_per_minute)
-                                    .suffix(format!(
-                                        " / min {}",
-                                        text(self.language, "used_per_minute")
-                                    )),
-                            )
-                            .changed();
+                            .scope(|ui| {
+                                let accent = egui::Color32::from_rgb(0x4B, 0xB4, 0xCE);
+                                ui.visuals_mut().selection.bg_fill = accent;
+                                ui.visuals_mut().selection.stroke =
+                                    egui::Stroke::new(1.0_f32, accent);
+                                ui.visuals_mut().widgets.hovered.bg_stroke.color = accent;
+                                ui.visuals_mut().widgets.active.bg_stroke.color = accent;
+                                ui.horizontal(|ui| {
+                                    let slider_changed = ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut node.used_per_minute,
+                                                0.0..=node.capacity_per_minute,
+                                            )
+                                            .text(usage_text)
+                                            .show_value(false),
+                                        )
+                                        .changed();
+                                    let input_changed = ui
+                                        .add(
+                                            egui::DragValue::new(&mut node.used_per_minute)
+                                                .speed(1.0)
+                                                .range(0.0..=node.capacity_per_minute)
+                                                .suffix(" / min"),
+                                        )
+                                        .changed();
+                                    slider_changed || input_changed
+                                })
+                                .inner
+                            })
+                            .inner;
                         if usage_changed {
                             node.usage_overridden = true;
                             changed = true;
                         }
                         node.clamp_usage_to_capacity();
 
-                        let utilization = node.utilization();
-                        ui.label(format!(
-                            "{}: {:.0} / min",
-                            text(self.language, "free_per_minute"),
-                            node.remaining_per_minute()
-                        ));
-                        ui.label(format!(
-                            "{}: {:.1}%",
-                            text(self.language, "occupancy"),
-                            utilization * 100.0
-                        ));
-                        ui.add(
-                            egui::ProgressBar::new(utilization.clamp(0.0, 1.0)).show_percentage(),
-                        );
                         ui.label(text(self.language, "note"));
                     }
                     changed |= ui.text_edit_multiline(&mut node.note).changed();
                 });
-            });
+                ui.min_rect()
+            },
+        );
 
         if changed {
             self.allocation_dirty = true;
@@ -1922,12 +2303,15 @@ impl MapView {
             self.allocation_save_requested = self.allocation_dirty;
             self.selected_id = None;
         }
-        Some(inner.response.rect)
+        Some(popup_rect)
     }
 
     fn visible_nodes(&self) -> impl Iterator<Item = &ResourceNode> {
         self.nodes.iter().filter(|node| {
-            (self.resource_filter == ALL_RESOURCES_FILTER || node.resource == self.resource_filter)
+            (self
+                .selected_resources
+                .as_ref()
+                .is_none_or(|resources| resources.contains(&node.resource)))
                 && (self.purity_filter == ALL_PURITY_FILTER || node.purity == self.purity_filter)
                 && (!self.only_used || node.extractor_instance.is_some())
                 && (!self.only_partial || has_remaining_capacity(node))
@@ -2042,6 +2426,81 @@ impl MapView {
         }
     }
 
+    fn erase_strokes_at(&mut self, rect: egui::Rect, pointer: egui::Pos2) {
+        let center = self.world_at_screen(rect, pointer);
+        let center = [center.x, center.y];
+        let strokes = std::mem::take(&mut self.strokes);
+        let mut remaining = Vec::with_capacity(strokes.len());
+        let mut operations = Vec::new();
+
+        for stroke in strokes {
+            let replacement =
+                erase_stroke_outside_circle(&stroke, center, FREEHAND_ERASER_RADIUS_WORLD);
+            if replacement.len() == 1 && same_stroke(&replacement[0], &stroke) {
+                remaining.push(stroke);
+            } else {
+                remaining.extend(replacement.iter().cloned());
+                operations.push(MapStrokeErase {
+                    original: stroke,
+                    replacement,
+                });
+            }
+        }
+
+        let erased_any = !operations.is_empty();
+        self.strokes = remaining;
+        for operation in operations {
+            self.record_drawing(MapAnnotation::StrokeErase(operation));
+        }
+        if erased_any {
+            self.stroke_save_requested = true;
+        }
+    }
+
+    fn draw_strokes(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        eraser_pointer: Option<egui::Pos2>,
+    ) {
+        let stroke = egui::Stroke::new(2.6_f32, annotation_color(255));
+        for annotation in &self.strokes {
+            let points = annotation
+                .points
+                .iter()
+                .map(|point| self.to_screen(rect, point[0], point[1]))
+                .collect::<Vec<_>>();
+            if points.len() >= 2 {
+                painter.add(egui::Shape::line(points, stroke));
+            }
+        }
+        if let Some(points) = &self.freehand_current_stroke {
+            let points = points
+                .iter()
+                .map(|point| self.to_screen(rect, point[0], point[1]))
+                .collect::<Vec<_>>();
+            if points.len() >= 2 {
+                painter.add(egui::Shape::line(points, stroke));
+            }
+        }
+        if self.eraser_tool_active {
+            if let Some(pointer) = eraser_pointer {
+                let world = self.world_at_screen(rect, pointer);
+                let edge = self.to_screen(rect, world.x + FREEHAND_ERASER_RADIUS_WORLD, world.y);
+                painter.circle_filled(
+                    pointer,
+                    pointer.distance(edge),
+                    egui::Color32::from_rgba_unmultiplied(255, 152, 37, 18),
+                );
+                painter.circle_stroke(
+                    pointer,
+                    pointer.distance(edge),
+                    egui::Stroke::new(1.5_f32, annotation_color(220)),
+                );
+            }
+        }
+    }
+
     fn draw_rectangles(&self, painter: &egui::Painter, rect: egui::Rect) {
         let fill = annotation_color(24);
         let stroke = egui::Stroke::new(2.0_f32, annotation_color(255));
@@ -2142,7 +2601,7 @@ impl MapView {
             draw_text_with_shadow(
                 painter,
                 self.to_screen(rect, annotation.world_x, annotation.world_y),
-                egui::Align2::CENTER_CENTER,
+                egui::Align2::LEFT_TOP,
                 &annotation.text,
                 // Keep the annotation readable at a constant screen size. Its
                 // anchor still uses world coordinates, so it remains attached
@@ -2161,7 +2620,7 @@ impl MapView {
         let world = self.text_edit_world?;
         let available = context.available_rect();
         let anchor = self.to_screen(map_rect, world.x, world.y);
-        let popup_size = egui::vec2(270.0, 92.0);
+        let popup_size = egui::vec2(300.0, 170.0);
         let mut position = anchor + egui::vec2(10.0, 10.0);
         if position.x + popup_size.x > available.right() {
             position.x = available.right() - popup_size.x - 8.0;
@@ -2179,15 +2638,14 @@ impl MapView {
             .show(context, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new(text(self.language, "text_label")).strong());
-                    let response = ui
-                        .add(egui::TextEdit::singleline(&mut self.text_edit_buffer).id(editor_id));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.text_edit_buffer)
+                            .id(editor_id)
+                            .desired_width(280.0)
+                            .desired_rows(5),
+                    );
                     if self.text_edit_buffer.is_empty() {
                         ui.memory_mut(|memory| memory.request_focus(editor_id));
-                    }
-                    if response.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    {
-                        commit = true;
                     }
                     ui.horizontal(|ui| {
                         if ui.button(text(self.language, "save_text")).clicked() {
@@ -2207,73 +2665,104 @@ impl MapView {
         Some(inner.response.rect)
     }
 
-    fn draw_foundations(&self, painter: &egui::Painter, rect: egui::Rect, time: f32) {
+    fn draw_foundations(&mut self, painter: &egui::Painter, rect: egui::Rect, time: f32) {
         let visible_rect = rect.expand(8.0);
         let fill = egui::Color32::from_rgba_unmultiplied(185, 194, 198, 24);
         let outline = egui::Color32::from_rgba_unmultiplied(185, 194, 198, 150);
         let stripe = egui::Color32::from_rgba_unmultiplied(185, 194, 198, 72);
-        let mut fill_mesh = egui::Mesh::default();
-        let mut stripe_mesh = egui::Mesh::default();
-        let mut outline_mesh = egui::Mesh::default();
-        for cluster in &self.foundation_clusters {
-            let bounds = egui::Rect::from_min_max(
-                self.to_screen(rect, cluster.min_x, cluster.min_y),
-                self.to_screen(rect, cluster.max_x, cluster.max_y),
-            )
-            .expand(2.0);
-            if !bounds.intersects(visible_rect) {
-                continue;
-            }
-            for contour in &cluster.contours {
-                let points = contour
-                    .iter()
-                    .map(|point| self.to_screen(rect, point[0], point[1]))
-                    .collect::<Vec<_>>();
-                if points.len() < 3 {
+        let key = RenderViewKey {
+            rect_min_x: rect.min.x,
+            rect_min_y: rect.min.y,
+            rect_max_x: rect.max.x,
+            rect_max_y: rect.max.y,
+            zoom: self.zoom,
+            pan_x: self.pan.x,
+            pan_y: self.pan.y,
+            data_generation: self.layer_data_generation,
+        };
+        let cache_is_current = self
+            .foundation_render_cache
+            .as_ref()
+            .is_some_and(|cache| cache.key == key);
+        if !cache_is_current {
+            let mut cache = FoundationRenderCache {
+                key,
+                contours: Vec::new(),
+                fill_mesh: egui::Mesh::default(),
+                outline_mesh: egui::Mesh::default(),
+            };
+            for cluster in &self.foundation_clusters {
+                let bounds = egui::Rect::from_min_max(
+                    self.to_screen(rect, cluster.min_x, cluster.min_y),
+                    self.to_screen(rect, cluster.max_x, cluster.max_y),
+                )
+                .expand(2.0);
+                if !bounds.intersects(visible_rect) {
                     continue;
                 }
-                let contour_bounds = egui::Rect::from_points(&points);
-                if !contour_bounds.intersects(visible_rect) {
-                    continue;
-                }
-                append_scanline_fill(&mut fill_mesh, &points, fill, FOUNDATION_FILL_STEP);
-                append_animated_stripes(
-                    &mut stripe_mesh,
-                    &points,
-                    stripe,
-                    time,
-                    FOUNDATION_STRIPE_SPACING,
-                );
-                for pair in points
-                    .iter()
-                    .copied()
-                    .zip(points.iter().copied().cycle().skip(1))
-                    .take(points.len())
-                {
-                    push_thick_line(&mut outline_mesh, pair.0, pair.1, 1.1_f32, outline);
+                for contour in &cluster.contours {
+                    let points = contour
+                        .iter()
+                        .map(|point| self.to_screen(rect, point[0], point[1]))
+                        .collect::<Vec<_>>();
+                    if points.len() < 3 {
+                        continue;
+                    }
+                    let contour_bounds = egui::Rect::from_points(&points);
+                    if !contour_bounds.intersects(visible_rect) {
+                        continue;
+                    }
+                    append_scanline_fill(&mut cache.fill_mesh, &points, fill, FOUNDATION_FILL_STEP);
+                    for pair in points
+                        .iter()
+                        .copied()
+                        .zip(points.iter().copied().cycle().skip(1))
+                        .take(points.len())
+                    {
+                        push_thick_line(&mut cache.outline_mesh, pair.0, pair.1, 1.1_f32, outline);
+                    }
+                    cache.contours.push(points);
                 }
             }
+            self.foundation_render_cache = Some(cache);
         }
 
-        if !fill_mesh.indices.is_empty() {
-            painter.add(egui::Shape::mesh(fill_mesh));
+        let cache = self
+            .foundation_render_cache
+            .as_ref()
+            .expect("foundation render cache was created");
+        if !cache.fill_mesh.indices.is_empty() {
+            painter.add(egui::Shape::mesh(cache.fill_mesh.clone()));
+        }
+        let mut stripe_mesh = egui::Mesh::default();
+        for points in &cache.contours {
+            append_animated_stripes(
+                &mut stripe_mesh,
+                points,
+                stripe,
+                time,
+                FOUNDATION_STRIPE_SPACING,
+            );
         }
         if !stripe_mesh.indices.is_empty() {
             painter.add(egui::Shape::mesh(stripe_mesh));
         }
-        if !outline_mesh.indices.is_empty() {
-            painter.add(egui::Shape::mesh(outline_mesh));
+        if !cache.outline_mesh.indices.is_empty() {
+            painter.add(egui::Shape::mesh(cache.outline_mesh.clone()));
         }
     }
 
-    fn draw_belts(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_belts(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        let mut cache = self.belt_render_cache.take();
         self.draw_spline_layer(
             painter,
             rect,
             self.belts.iter().map(|segment| segment.points.as_slice()),
             egui::Color32::from_rgb(0xEA, 0xD5, 0x6E),
             2.5_f32,
+            &mut cache,
         );
+        self.belt_render_cache = cache;
     }
 
     fn draw_spline_layer<'a, I>(
@@ -2283,42 +2772,63 @@ impl MapView {
         segments: I,
         color: egui::Color32,
         line_width: f32,
+        cache: &mut Option<SplineRenderCache>,
     ) where
         I: IntoIterator<Item = &'a [crate::save_parser::ParsedRailPoint]>,
     {
-        let visible_rect = rect.expand(12.0);
-        let mut underlay_mesh = egui::Mesh::default();
-        let mut overlay_mesh = egui::Mesh::default();
-
-        for points in segments {
-            self.push_spline_mesh(
-                rect,
-                visible_rect,
-                points,
-                &mut underlay_mesh,
-                &mut overlay_mesh,
-                line_width,
-                color,
-                10,
-            );
+        let key = RenderViewKey {
+            rect_min_x: rect.min.x,
+            rect_min_y: rect.min.y,
+            rect_max_x: rect.max.x,
+            rect_max_y: rect.max.y,
+            zoom: self.zoom,
+            pan_x: self.pan.x,
+            pan_y: self.pan.y,
+            data_generation: self.layer_data_generation,
+        };
+        let cache_is_current = cache.as_ref().is_some_and(|cached| cached.key == key);
+        if !cache_is_current {
+            let visible_rect = rect.expand(12.0);
+            let mut new_cache = SplineRenderCache {
+                key,
+                underlay_mesh: egui::Mesh::default(),
+                overlay_mesh: egui::Mesh::default(),
+            };
+            for points in segments {
+                self.push_spline_mesh(
+                    rect,
+                    visible_rect,
+                    points,
+                    &mut new_cache.underlay_mesh,
+                    &mut new_cache.overlay_mesh,
+                    line_width,
+                    color,
+                    10,
+                );
+            }
+            *cache = Some(new_cache);
         }
 
-        if !underlay_mesh.indices.is_empty() {
-            painter.add(egui::Shape::mesh(underlay_mesh));
+        let cached = cache.as_ref().expect("spline render cache was created");
+        if !cached.underlay_mesh.indices.is_empty() {
+            painter.add(egui::Shape::mesh(cached.underlay_mesh.clone()));
         }
-        if !overlay_mesh.indices.is_empty() {
-            painter.add(egui::Shape::mesh(overlay_mesh));
+        if !cached.overlay_mesh.indices.is_empty() {
+            painter.add(egui::Shape::mesh(cached.overlay_mesh.clone()));
         }
     }
 
-    fn draw_rails(&self, painter: &egui::Painter, rect: egui::Rect) {
+    fn draw_rails(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        let mut cache = self.rail_render_cache.take();
         self.draw_spline_layer(
             painter,
             rect,
             self.rails.iter().map(|segment| segment.points.as_slice()),
             egui::Color32::from_rgb(0xB9, 0xC2, 0xC6),
             1.8_f32,
+            &mut cache,
         );
+        self.rail_render_cache = cache;
     }
 
     fn push_spline_mesh(
@@ -2387,17 +2897,17 @@ impl MapView {
     }
 
     fn draw_resource_well_links(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let cores: Vec<&ResourceNode> = self
-            .visible_nodes()
-            .filter(|node| node.extraction_method == ExtractionMethod::ResourceWellCore)
-            .collect();
-        let satellites: Vec<&ResourceNode> = self
-            .visible_nodes()
-            .filter(|node| {
-                node.extraction_method == ExtractionMethod::ResourceWellExtractor
-                    && node.extractor_instance.is_some()
-            })
-            .collect();
+        let mut cores = Vec::new();
+        let mut satellites = Vec::new();
+        for node in self.visible_nodes() {
+            match node.extraction_method {
+                ExtractionMethod::ResourceWellCore => cores.push(node),
+                ExtractionMethod::ResourceWellExtractor if node.extractor_instance.is_some() => {
+                    satellites.push(node)
+                }
+                _ => {}
+            }
+        }
 
         for satellite in satellites {
             let Some(core) = cores
@@ -2609,6 +3119,132 @@ fn world_rectangle_screen_rect(
     egui::Rect::from_points(&points)
 }
 
+fn erase_stroke_outside_circle(
+    stroke: &MapStroke,
+    center: [f32; 2],
+    radius: f32,
+) -> Vec<MapStroke> {
+    if stroke.points.len() < 2 {
+        return if stroke
+            .points
+            .first()
+            .is_some_and(|point| squared_distance(*point, center) >= radius * radius)
+        {
+            vec![stroke.clone()]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    for pair in stroke.points.windows(2) {
+        let pieces = segment_outside_circle(pair[0], pair[1], center, radius);
+        if pieces.is_empty() {
+            push_stroke_chunk(&mut chunks, &mut current);
+            continue;
+        }
+        for (start, end) in pieces {
+            if current
+                .last()
+                .is_some_and(|point| points_close(*point, start))
+            {
+                if !current
+                    .last()
+                    .is_some_and(|point| points_close(*point, end))
+                {
+                    current.push(end);
+                }
+            } else {
+                push_stroke_chunk(&mut chunks, &mut current);
+                current.push(start);
+                if !points_close(start, end) {
+                    current.push(end);
+                }
+            }
+        }
+    }
+    push_stroke_chunk(&mut chunks, &mut current);
+    chunks
+}
+
+fn segment_outside_circle(
+    start: [f32; 2],
+    end: [f32; 2],
+    center: [f32; 2],
+    radius: f32,
+) -> Vec<([f32; 2], [f32; 2])> {
+    let delta = [end[0] - start[0], end[1] - start[1]];
+    let a = delta[0] * delta[0] + delta[1] * delta[1];
+    if a <= f32::EPSILON {
+        return if squared_distance(start, center) >= radius * radius {
+            vec![(start, end)]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let offset = [start[0] - center[0], start[1] - center[1]];
+    let b = 2.0 * (offset[0] * delta[0] + offset[1] * delta[1]);
+    let c = offset[0] * offset[0] + offset[1] * offset[1] - radius * radius;
+    let discriminant = b * b - 4.0 * a * c;
+    let mut cuts = vec![0.0, 1.0];
+    if discriminant > 0.0 {
+        let root = discriminant.sqrt();
+        let t1 = (-b - root) / (2.0 * a);
+        let t2 = (-b + root) / (2.0 * a);
+        if (0.0..1.0).contains(&t1) {
+            cuts.push(t1);
+        }
+        if (0.0..1.0).contains(&t2) {
+            cuts.push(t2);
+        }
+    }
+    cuts.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    cuts.dedup_by(|left, right| (*left - *right).abs() <= f32::EPSILON);
+
+    let point_at = |time: f32| [start[0] + delta[0] * time, start[1] + delta[1] * time];
+    let mut outside = Vec::new();
+    for pair in cuts.windows(2) {
+        let from = pair[0];
+        let to = pair[1];
+        let midpoint = point_at((from + to) * 0.5);
+        if squared_distance(midpoint, center) >= radius * radius {
+            outside.push((point_at(from), point_at(to)));
+        }
+    }
+    outside
+}
+
+fn push_stroke_chunk(chunks: &mut Vec<MapStroke>, current: &mut Vec<[f32; 2]>) {
+    if current.len() >= 2 {
+        chunks.push(MapStroke {
+            points: std::mem::take(current),
+        });
+    } else {
+        current.clear();
+    }
+}
+
+fn squared_distance(left: [f32; 2], right: [f32; 2]) -> f32 {
+    let x = left[0] - right[0];
+    let y = left[1] - right[1];
+    x * x + y * y
+}
+
+fn points_close(left: [f32; 2], right: [f32; 2]) -> bool {
+    squared_distance(left, right) <= 0.01
+}
+
+fn same_stroke(left: &MapStroke, right: &MapStroke) -> bool {
+    left.points.len() == right.points.len()
+        && left
+            .points
+            .iter()
+            .zip(&right.points)
+            .all(|(left, right)| points_close(*left, *right))
+}
+
 fn draw_screen_arrow(
     painter: &egui::Painter,
     start: egui::Pos2,
@@ -2635,6 +3271,82 @@ fn draw_screen_arrow(
         stroke.color,
         egui::Stroke::NONE,
     ));
+}
+
+fn draw_drawing_tool_cursor(painter: &egui::Painter, center: egui::Pos2, tool: DrawingToolIcon) {
+    let accent = annotation_color(255);
+    let dark = egui::Color32::from_rgba_unmultiplied(8, 13, 18, 230);
+    let icon_stroke = egui::Stroke::new(1.8_f32, accent);
+    painter.circle_filled(center, 14.0, dark);
+    painter.circle_stroke(center, 14.0, egui::Stroke::new(1.0_f32, accent));
+
+    match tool {
+        DrawingToolIcon::Rectangle => {
+            let half = egui::vec2(6.0, 5.0);
+            let top_left = center - half;
+            let top_right = center + egui::vec2(half.x, -half.y);
+            let bottom_right = center + half;
+            let bottom_left = center + egui::vec2(-half.x, half.y);
+            painter.line_segment([top_left, top_right], icon_stroke);
+            painter.line_segment([top_right, bottom_right], icon_stroke);
+            painter.line_segment([bottom_right, bottom_left], icon_stroke);
+            painter.line_segment([bottom_left, top_left], icon_stroke);
+        }
+        DrawingToolIcon::Circle => {
+            painter.circle_stroke(center, 6.0, icon_stroke);
+        }
+        DrawingToolIcon::Arrow => {
+            draw_screen_arrow(
+                painter,
+                center - egui::vec2(6.0, 5.0),
+                center + egui::vec2(7.0, 5.0),
+                icon_stroke,
+            );
+        }
+        DrawingToolIcon::Text => {
+            painter.text(
+                center,
+                egui::Align2::CENTER_CENTER,
+                "T",
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+        }
+        DrawingToolIcon::Pen => {
+            let start = center - egui::vec2(6.0, -6.0);
+            let end = center + egui::vec2(6.0, -6.0);
+            painter.line_segment([start, end], icon_stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    end + egui::vec2(2.0, -2.0),
+                    end + egui::vec2(-2.0, -3.0),
+                    end + egui::vec2(-3.0, 2.0),
+                ],
+                accent,
+                egui::Stroke::NONE,
+            ));
+        }
+        DrawingToolIcon::Eraser => {
+            let points = vec![
+                center + egui::vec2(-7.0, 2.0),
+                center + egui::vec2(1.0, -7.0),
+                center + egui::vec2(7.0, -2.0),
+                center + egui::vec2(-1.0, 7.0),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                accent,
+                egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+            ));
+            painter.line_segment(
+                [
+                    center + egui::vec2(-2.0, 5.5),
+                    center + egui::vec2(3.0, -0.5),
+                ],
+                egui::Stroke::new(1.4_f32, dark),
+            );
+        }
+    }
 }
 
 fn normalize_purity_filter(value: &str) -> String {
@@ -3219,6 +3931,10 @@ fn format_resource_amount(value: f32) -> String {
 fn draw_claimed_badge(painter: &egui::Painter, position: egui::Pos2, radius: f32) {
     let badge_center = position + egui::vec2(-radius * 0.78, -radius * 0.78);
     let badge_radius = (radius * 0.46).clamp(4.0, 6.5);
+    draw_check_badge(painter, badge_center, badge_radius);
+}
+
+fn draw_check_badge(painter: &egui::Painter, badge_center: egui::Pos2, badge_radius: f32) {
     let background = egui::Color32::from_rgb(0x08, 0xC4, 0x62);
 
     painter.circle_filled(badge_center, badge_radius, background);
@@ -3339,9 +4055,29 @@ fn node_tooltip(
     node: &ResourceNode,
     well_totals: Option<ResourceWellTotals>,
     language: Language,
+    icon: Option<&egui::TextureHandle>,
 ) {
-    ui.label(egui::RichText::new(&node.resource).strong());
-    node_details(ui, node, language);
+    ui.horizontal(|ui| {
+        if let Some(icon) = icon {
+            ui.add(egui::Image::from_texture(icon).fit_to_exact_size(egui::vec2(24.0, 24.0)));
+        }
+        ui.label(
+            egui::RichText::new(&node.resource)
+                .heading()
+                .color(egui::Color32::WHITE),
+        );
+        if node.extractor_instance.is_some() {
+            let (_, badge_rect) = ui.allocate_space(egui::vec2(16.0, 16.0));
+            draw_check_badge(ui.painter(), badge_rect.center(), 6.0);
+        }
+        ui.label(egui::RichText::new("·").color(ui.visuals().text_color()));
+        ui.label(
+            egui::RichText::new(&node.purity)
+                .strong()
+                .color(purity_color(node)),
+        );
+    });
+    node_details(ui, node, language, false, true);
 
     if let Some(totals) = well_totals {
         ui.separator();
@@ -3426,8 +4162,16 @@ fn show_resource_well_totals(ui: &mut egui::Ui, totals: ResourceWellTotals, lang
     ui.add(egui::ProgressBar::new(utilization).show_percentage());
 }
 
-fn node_details(ui: &mut egui::Ui, node: &ResourceNode, language: Language) {
-    ui.small(format!("{}  {}", text(language, "node_id"), node.id));
+fn node_details(
+    ui: &mut egui::Ui,
+    node: &ResourceNode,
+    language: Language,
+    show_claimed: bool,
+    compact_extractor: bool,
+) {
+    if !compact_extractor {
+        ui.small(format!("{}  {}", text(language, "node_id"), node.id));
+    }
     ui.small(format!(
         "{}  X {:.0} · Y {:.0} · Z {:.0}",
         text(language, "world"),
@@ -3436,33 +4180,68 @@ fn node_details(ui: &mut egui::Ui, node: &ResourceNode, language: Language) {
         node.world_z
     ));
 
-    let claimed = node.extractor_instance.is_some();
-    ui.label(if claimed {
-        text(language, "claimed")
-    } else {
-        text(language, "unclaimed")
-    });
+    if show_claimed {
+        let claimed = node.extractor_instance.is_some();
+        ui.label(if claimed {
+            text(language, "claimed")
+        } else {
+            text(language, "unclaimed")
+        });
+    }
 
     if let Some(kind) = &node.extractor_kind {
-        ui.label(format!("Extractor  {}", short_type_name(kind)));
-        ui.label(format!(
-            "{}  {} · Overclock  {:.0}% / max {:.0}%",
-            text(language, "powershards_clock"),
-            node.power_shards,
-            node.current_overclock * 100.0,
-            node.max_overclock * 100.0
-        ));
+        if compact_extractor {
+            ui.label(format!(
+                "Extractor: {} (+{:.0}%)",
+                extractor_display_name(node, kind, language),
+                node.max_overclock * 100.0
+            ));
+        } else {
+            ui.label(format!("Extractor  {}", short_type_name(kind)));
+            ui.label(format!(
+                "{}  {} · Overclock  {:.0}% / max {:.0}%",
+                text(language, "powershards_clock"),
+                node.power_shards,
+                node.current_overclock * 100.0,
+                node.max_overclock * 100.0
+            ));
+        }
     } else {
         ui.label(format!(
-            "Extractor  {}",
-            text(language, "extractor_unknown")
+            "Extractor: {}",
+            if compact_extractor {
+                text(language, "extractor_unknown")
+            } else {
+                text(language, "extractor_unknown")
+            }
         ));
     }
-    ui.label(format!(
-        "{}  {}",
-        text(language, "method"),
-        extraction_method_label(node, language)
-    ));
+    if !compact_extractor {
+        ui.label(format!(
+            "{}  {}",
+            text(language, "method"),
+            extraction_method_label(node, language)
+        ));
+    }
+}
+
+fn extractor_display_name(node: &ResourceNode, kind: &str, language: Language) -> String {
+    match node.extraction_method {
+        ExtractionMethod::Miner => {
+            let tier = if kind.contains("Mk3") {
+                3
+            } else if kind.contains("Mk2") {
+                2
+            } else {
+                1
+            };
+            format!("Miner Mk.{tier}")
+        }
+        ExtractionMethod::OilExtractor => text(language, "oil_extractor").to_owned(),
+        ExtractionMethod::ResourceWellExtractor => text(language, "well_extractor").to_owned(),
+        ExtractionMethod::ResourceWellCore => "Resource Well Core".to_owned(),
+        ExtractionMethod::ManualDeposit => text(language, "manual_deposit").to_owned(),
+    }
 }
 
 fn miner_base_rate(miner_level: u8) -> f32 {

@@ -107,11 +107,24 @@ pub struct MapText {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MapStroke {
+    pub points: Vec<[f32; 2]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MapStrokeErase {
+    pub original: MapStroke,
+    pub replacement: Vec<MapStroke>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MapAnnotation {
     Rectangle(MapRectangle),
     Circle(MapCircle),
     Arrow(MapArrow),
     Text(MapText),
+    Stroke(MapStroke),
+    StrokeErase(MapStrokeErase),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +139,10 @@ pub struct AppSettings {
     pub pause_map_when_unfocused: bool,
     #[serde(default = "default_resource_filter")]
     pub resource_filter: String,
+    /// `None` keeps the legacy/default meaning of all resources selected.
+    /// `Some(empty)` is therefore a valid explicit selection: no resources.
+    #[serde(default)]
+    pub selected_resources: Option<Vec<String>>,
     #[serde(default = "default_purity_filter")]
     pub purity_filter: String,
     #[serde(default)]
@@ -134,6 +151,8 @@ pub struct AppSettings {
     pub node_scale: f32,
     #[serde(default)]
     pub show_grid: bool,
+    #[serde(default = "default_show_annotations")]
+    pub show_annotations: bool,
     #[serde(default)]
     pub only_partial: bool,
     #[serde(default)]
@@ -154,10 +173,12 @@ impl Default for AppSettings {
             debug_mode: false,
             pause_map_when_unfocused: true,
             resource_filter: "Alle Ressourcen".to_owned(),
+            selected_resources: None,
             purity_filter: "Alle Reinheiten".to_owned(),
             only_claimed: false,
             node_scale: 1.0,
             show_grid: false,
+            show_annotations: true,
             only_partial: false,
             show_rails: false,
             show_foundations: false,
@@ -189,6 +210,10 @@ fn default_purity_filter() -> String {
 
 fn default_node_scale() -> f32 {
     1.0
+}
+
+fn default_show_annotations() -> bool {
+    true
 }
 
 impl DiffSummary {
@@ -246,6 +271,8 @@ pub struct PersistentState {
     #[serde(default)]
     pub texts_by_save: BTreeMap<String, Vec<MapText>>,
     #[serde(default)]
+    pub strokes_by_save: BTreeMap<String, Vec<MapStroke>>,
+    #[serde(default)]
     pub drawing_history_by_save: BTreeMap<String, Vec<MapAnnotation>>,
     #[serde(default)]
     pub settings: AppSettings,
@@ -271,6 +298,7 @@ impl Default for PersistentState {
             circles_by_save: BTreeMap::new(),
             arrows_by_save: BTreeMap::new(),
             texts_by_save: BTreeMap::new(),
+            strokes_by_save: BTreeMap::new(),
             drawing_history_by_save: BTreeMap::new(),
             settings: AppSettings::default(),
             future_fields: BTreeMap::new(),
@@ -384,6 +412,33 @@ impl Storage {
         self.state.previous_snapshot = None;
         self.state.last_diff = None;
         self.state.node_allocations.clear();
+        self.persist()
+    }
+
+    pub fn delete_all_smt_notes(&mut self) -> Result<()> {
+        if self.active_save_path.exists() {
+            fs::remove_file(&self.active_save_path).with_context(|| {
+                format!(
+                    "Konnte die lokale SMT-Savegame-Kopie nicht entfernen: {}",
+                    self.active_save_path.display()
+                )
+            })?;
+        }
+
+        self.state.source_path = None;
+        self.state.current_snapshot = None;
+        self.state.previous_snapshot = None;
+        self.state.last_diff = None;
+        self.state.node_allocations.clear();
+        self.state.allocations_by_save.clear();
+        self.state.miner_tier_by_save.clear();
+        self.state.resource_order_by_save.clear();
+        self.state.rectangles_by_save.clear();
+        self.state.circles_by_save.clear();
+        self.state.arrows_by_save.clear();
+        self.state.texts_by_save.clear();
+        self.state.strokes_by_save.clear();
+        self.state.drawing_history_by_save.clear();
         self.persist()
     }
 
@@ -583,6 +638,20 @@ impl Storage {
     pub fn save_active_texts(&mut self, texts: Vec<MapText>) -> Result<()> {
         let profile_key = self.active_profile_key();
         self.state.texts_by_save.insert(profile_key, texts);
+        self.persist()
+    }
+
+    pub fn active_strokes(&self) -> Vec<MapStroke> {
+        self.state
+            .strokes_by_save
+            .get(&self.active_profile_key())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn save_active_strokes(&mut self, strokes: Vec<MapStroke>) -> Result<()> {
+        let profile_key = self.active_profile_key();
+        self.state.strokes_by_save.insert(profile_key, strokes);
         self.persist()
     }
 
