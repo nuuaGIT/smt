@@ -1,17 +1,5 @@
 [
   {
-    "id": "BP_ResourceDeposit1642",
-    "resource": "Desc_OreUranium_C",
-    "purity": "normal",
-    "classPath": "BP_ResourceDeposit_C",
-    "nodeType": "deposit",
-    "displayName": "Uranium",
-    "x": 159055,
-    "y": -126925,
-    "z": 9480,
-    "rotation": 303.63
-  },
-  {
     "id": "BP_FrackingCore6_UAID_40B076DF2F79D3DF01_1961476789",
     "resource": "Desc_LiquidOil_C",
     "purity": "normal",

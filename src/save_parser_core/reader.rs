@@ -26,7 +26,11 @@ pub const EMPTY_STR: StrRef = StrRef {
 
 impl StrRef {
     pub fn bytes<'a>(&self, data: &'a [u8]) -> &'a [u8] {
-        &data[self.off..self.off + self.len as usize]
+        let end = self
+            .off
+            .checked_add(self.len as usize)
+            .expect("validated string reference must fit in the save buffer");
+        &data[self.off..end]
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -35,7 +39,7 @@ impl StrRef {
     pub fn eq_ascii(&self, data: &[u8], s: &str) -> bool {
         !self.wide && self.bytes(data) == s.as_bytes()
     }
-    pub fn to_string(&self, data: &[u8]) -> String {
+    pub fn decode(&self, data: &[u8]) -> String {
         if self.len == 0 {
             return String::new();
         }
@@ -64,7 +68,11 @@ pub struct DataRef {
 
 impl DataRef {
     pub fn bytes<'a>(&self, data: &'a [u8]) -> &'a [u8] {
-        &data[self.off..self.off + self.len as usize]
+        let end = self
+            .off
+            .checked_add(self.len as usize)
+            .expect("validated data reference must fit in the save buffer");
+        &data[self.off..end]
     }
 }
 
@@ -77,7 +85,14 @@ macro_rules! prim_reader {
     ($name:ident, $ty:ty, $len:expr, $pyname:expr) => {
         #[inline]
         pub fn $name(&mut self) -> PResult<$ty> {
-            let end = self.pos + $len;
+            let end = self.pos.checked_add($len).ok_or_else(|| {
+                perr!(
+                    "Offset {} too large for {} in {}-byte data.",
+                    self.pos,
+                    $pyname,
+                    self.data.len()
+                )
+            })?;
             if end > self.data.len() {
                 return Err(perr!(
                     "Offset {} too large for {} in {}-byte data.",
@@ -172,7 +187,8 @@ impl<'a> Cursor<'a> {
             }
             let r = StrRef {
                 off: self.pos,
-                len: (n - 1) as u32,
+                len: u32::try_from(n - 1)
+                    .map_err(|_| perr!("String is too large at offset {}.", len_off))?,
                 wide: false,
             };
             self.pos += n;
@@ -208,7 +224,8 @@ impl<'a> Cursor<'a> {
             }
             let r = StrRef {
                 off: self.pos,
-                len: (byte_len - 2) as u32,
+                len: u32::try_from(byte_len - 2)
+                    .map_err(|_| perr!("String is too large at offset {}.", len_off))?,
                 wide: true,
             };
             self.pos += byte_len;
@@ -229,7 +246,12 @@ impl<'a> Cursor<'a> {
         }
         let r = DataRef {
             off: self.pos,
-            len: len as u32,
+            len: u32::try_from(len).map_err(|_| {
+                perr!(
+                    "Data reference length {} exceeds the supported maximum.",
+                    len
+                )
+            })?,
         };
         self.pos += len;
         Ok(r)
@@ -311,7 +333,7 @@ impl<'a> Cursor<'a> {
         if !s.eq_ascii(self.data, expected) {
             return Err(perr!(
                 "Value {} at offset {} does not match the expected value {}.",
-                s.to_string(self.data),
+                s.decode(self.data),
                 start,
                 expected
             ));
@@ -325,7 +347,7 @@ impl<'a> Cursor<'a> {
         if !s.eq_ascii(self.data, expected) {
             return Err(perr!(
                 "Value {} at offset {} does not match the expected value {}: {}",
-                s.to_string(self.data),
+                s.decode(self.data),
                 start,
                 expected,
                 msg
@@ -337,6 +359,6 @@ impl<'a> Cursor<'a> {
     /// Owned-string variant used for the (non-retained) compressed file header.
     pub fn string_owned(&mut self) -> PResult<String> {
         let r = self.string()?;
-        Ok(r.to_string(self.data))
+        Ok(r.decode(self.data))
     }
 }

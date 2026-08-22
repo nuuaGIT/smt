@@ -119,11 +119,22 @@ pub fn parse_object(
     let should_migrate = c.bool_u32("Object.shouldMigrateObjectRefsToPersistentFlag")?;
     let object_size = c.u32()? as usize;
     let offset_start_this = c.pos;
+    let object_end = offset_start_this
+        .checked_add(object_size)
+        .filter(|&end| end <= c.data.len())
+        .ok_or_else(|| {
+            perr!(
+                "Object size {} at offset {} overruns {}-byte data.",
+                object_size,
+                offset_start_this,
+                c.data.len()
+            )
+        })?;
 
     let mut per_object_version_data = None;
     let mut jump_offset = 0usize;
     if object_game_version >= 53 {
-        let mut jc = Cursor::new(c.data, c.pos + object_size);
+        let mut jc = Cursor::new(c.data, object_end);
         let should_serialize = jc.bool_u32("Object.shouldSerializePerObjectVersionData")?;
         if should_serialize {
             let vd = parse_save_object_version_data(&mut jc)?;
@@ -153,7 +164,7 @@ pub fn parse_object(
     c.confirm_u32(0)?;
 
     let mut actor_specific = ActorSpecific::None;
-    let trailing_byte_size = (offset_start_this + object_size) as i64 - c.pos as i64;
+    let trailing_byte_size = object_end as i64 - c.pos as i64;
 
     match header {
         Header::Actor(ah) => {
@@ -303,11 +314,18 @@ pub fn parse_object(
                                 let start = c.pos;
                                 let inner =
                                     parse_properties(c, header_save_version, object_ue5_version)?;
-                                if c.pos != start + size as usize {
+                                let expected_end =
+                                    start.checked_add(size as usize).ok_or_else(|| {
+                                        perr!(
+                                            "Lightweight data property size overflows at {}.",
+                                            start
+                                        )
+                                    })?;
+                                if c.pos != expected_end {
                                     return Err(perr!(
                                         "Unexpected LightweightBuildableSubsystem lightweightDataPropertySize: offset={} != {} = start={} + size={}.",
                                         c.pos,
-                                        start + size as usize,
+                                        expected_end,
                                         start,
                                         size
                                     ));
@@ -443,7 +461,7 @@ pub fn parse_object(
             let class_bytes = ch.class_name.bytes(c.data);
             let cn = std::str::from_utf8(class_bytes).unwrap_or("");
             if COMPONENT_TRAILING.contains(&cn) {
-                let has_trailing = c.pos < offset_start_this + object_size;
+                let has_trailing = c.pos < object_end;
                 actor_specific = ActorSpecific::ComponentTrailing(has_trailing);
                 if has_trailing {
                     c.confirm_u32_msg(0, cn)?;
@@ -453,17 +471,17 @@ pub fn parse_object(
     }
 
     // satisfactory-calculator.com re-save quirk handling
-    if c.pos < offset_start_this + object_size {
+    if c.pos < object_end {
         match header {
             Header::Actor(ah) => {
-                let tp = ah.type_path.to_string(c.data);
+                let tp = ah.type_path.decode(c.data);
                 calculator_extras.push(tp.clone());
                 if CALC_ACTOR_WHITELIST.contains(&tp.as_str()) {
                     c.confirm_u32(0)?;
                 }
             }
             Header::Component(ch) => {
-                let cn = ch.class_name.to_string(c.data);
+                let cn = ch.class_name.decode(c.data);
                 calculator_extras.push(cn.clone());
                 if CALC_COMPONENT_WHITELIST.contains(&cn.as_str()) {
                     c.confirm_u32(0)?;
@@ -472,7 +490,7 @@ pub fn parse_object(
         }
     }
 
-    if c.pos > offset_start_this + object_size {
+    if c.pos > object_end {
         return Err(perr!(
             "Unexpected objectSize: expect={} < actual={}.  Offset passed expected position by {} bytes.  Started at {}.",
             object_size,
@@ -481,17 +499,17 @@ pub fn parse_object(
             offset_start_this
         ));
     }
-    if c.pos < offset_start_this + object_size {
+    if c.pos < object_end {
         return match header {
             Header::Actor(ah) => Err(perr!(
                 "Found {} extra trailing bytes for ActorHeader {}.",
-                offset_start_this + object_size - c.pos,
-                ah.type_path.to_string(c.data)
+                object_end - c.pos,
+                ah.type_path.decode(c.data)
             )),
             Header::Component(ch) => Err(perr!(
                 "Found {} extra trailing bytes for ComponentHeader {}.",
-                offset_start_this + object_size - c.pos,
-                ch.class_name.to_string(c.data)
+                object_end - c.pos,
+                ch.class_name.decode(c.data)
             )),
         };
     }
@@ -519,15 +537,19 @@ pub fn skip_object(c: &mut Cursor) -> PResult<()> {
     let object_game_version = c.u32()?;
     c.bool_u32("Object.shouldMigrateObjectRefsToPersistentFlag")?;
     let object_size = c.u32()? as usize;
-    if c.pos + object_size > c.data.len() {
-        return Err(perr!(
-            "Object size {} at offset {} overruns {}-byte data.",
-            object_size,
-            c.pos,
-            c.data.len()
-        ));
-    }
-    c.pos += object_size;
+    let object_end = c
+        .pos
+        .checked_add(object_size)
+        .filter(|&end| end <= c.data.len())
+        .ok_or_else(|| {
+            perr!(
+                "Object size {} at offset {} overruns {}-byte data.",
+                object_size,
+                c.pos,
+                c.data.len()
+            )
+        })?;
+    c.pos = object_end;
     if object_game_version >= 53 {
         let should_serialize = c.bool_u32("Object.shouldSerializePerObjectVersionData")?;
         if should_serialize {
@@ -545,7 +567,7 @@ impl crate::store::SaveStore {
     pub fn parse_object_at(&self, li: usize, oi: usize) -> PResult<Object> {
         let level = &self.levels[li];
         let (off, len) = level.object_spans[oi];
-        let mut c = Cursor::new(&self.data, off as usize);
+        let mut c = Cursor::new(&self.data, off);
         // Quirk markers were already recorded during the initial parse.
         let mut scratch_extras = Vec::new();
         let object = parse_object(
@@ -556,11 +578,7 @@ impl crate::store::SaveStore {
             &self.tables,
             &mut scratch_extras,
         )?;
-        debug_assert_eq!(
-            c.pos,
-            off as usize + len as usize,
-            "span reparse length drift"
-        );
+        debug_assert_eq!(c.pos, off + len as usize, "span reparse length drift");
         Ok(object)
     }
 }

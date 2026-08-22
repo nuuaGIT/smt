@@ -28,21 +28,38 @@ pub(crate) fn parse_one_header(c: &mut Cursor, header_save_version: u32) -> PRes
             let instance_name = c.string()?;
             let flags = if has_flags { c.u32()? } else { 0 };
             let need_transform = c.bool_u32("needTransform")?;
-            if c.pos + 40 > c.data.len() {
-                return Err(perr!(
-                    "Offset {} too large for ActorHeader transform in {}-byte data.",
-                    c.pos,
-                    c.data.len()
-                ));
-            }
+            let transform_end = c
+                .pos
+                .checked_add(40)
+                .filter(|&end| end <= c.data.len())
+                .ok_or_else(|| {
+                    perr!(
+                        "Offset {} too large for ActorHeader transform in {}-byte data.",
+                        c.pos,
+                        c.data.len()
+                    )
+                })?;
             let transform_off = c.pos;
+            let transform_start = c.pos;
             let f = |i: usize| -> f32 {
-                f32::from_le_bytes(c.data[c.pos + i * 4..c.pos + i * 4 + 4].try_into().unwrap())
+                let start = transform_start + i * 4;
+                f32::from_le_bytes(c.data[start..start + 4].try_into().unwrap())
             };
             let rotation = [f(0), f(1), f(2), f(3)];
             let position = [f(4), f(5), f(6)];
             let scale = [f(7), f(8), f(9)];
-            c.pos += 40;
+            if rotation
+                .iter()
+                .chain(position.iter())
+                .chain(scale.iter())
+                .any(|value| !value.is_finite())
+            {
+                return Err(perr!(
+                    "ActorHeader transform contains a non-finite value at offset {}.",
+                    transform_off
+                ));
+            }
+            c.pos = transform_end;
             let was_placed_in_level = c.bool_u32("wasPlacedInLevel")?;
             Ok(Header::Actor(ActorHeader {
                 type_path,
@@ -75,6 +92,10 @@ pub(crate) fn parse_one_header(c: &mut Cursor, header_save_version: u32) -> PRes
     }
 }
 
+// The parser mirrors the save format in distinct phases; bundling these
+// references into one mutable context would make the lean/eager paths harder
+// to compare and easier to accidentally desynchronise.
+#[allow(clippy::too_many_arguments)]
 fn parse_headers_and_level(
     c: &mut Cursor,
     header_save_version: u32,
@@ -155,15 +176,26 @@ fn parse_headers_and_level(
     let objects_size_field_off = c.pos;
     let all_objects_size = c.u64()? as usize;
     let object_start = c.pos;
+    let objects_end = object_start
+        .checked_add(all_objects_size)
+        .filter(|&end| end <= c.data.len())
+        .ok_or_else(|| {
+            perr!(
+                "Level objects size {} at offset {} overruns {}-byte data.",
+                all_objects_size,
+                object_start,
+                c.data.len()
+            )
+        })?;
     let mut oc = Cursor::new(c.data, object_start);
-    c.pos += all_objects_size;
+    c.pos = objects_end;
 
     let spans = LevelSpans {
         header_size_field_off,
         headers_insert_off,
         objects_size_field_off,
         object_count_field_off: object_start,
-        bodies_insert_off: object_start + all_objects_size,
+        bodies_insert_off: objects_end,
     };
 
     // COMPAT EXPERIMENT: the per-level save version field appeared with 1.0
@@ -212,7 +244,7 @@ fn parse_headers_and_level(
     let mut objects = Vec::with_capacity(if lean { 0 } else { capped });
     let mut object_spans: Vec<(usize, u32)> = Vec::with_capacity(capped);
     let mut last_report = oc.pos;
-    for idx in 0..actor_and_component_count as usize {
+    for header in &headers {
         let object_record_start = oc.pos;
         if lean {
             skip_object(&mut oc)?;
@@ -221,7 +253,7 @@ fn parse_headers_and_level(
                 &mut oc,
                 header_save_version,
                 object_ue5_version,
-                &headers[idx],
+                header,
                 tables,
                 calculator_extras,
             )?;
@@ -361,7 +393,11 @@ fn parse_body_bytes_impl(
 ) -> PResult<SaveStore> {
     // SaveFileHeader: uncompressedSize (+8), truncate.
     let mut hc = Cursor::new(&decompressed, 0);
-    let uncompressed_size = hc.u64()? as usize + 8;
+    let reported_size = hc.u64()?;
+    let uncompressed_size = usize::try_from(reported_size)
+        .ok()
+        .and_then(|size| size.checked_add(8))
+        .ok_or_else(|| perr!("Reported uncompressed size is too large."))?;
     if uncompressed_size > decompressed.len() {
         return Err(perr!(
             "Reported uncompressed size {} is larger than the actual uncompressed size {}.",
@@ -391,10 +427,7 @@ fn parse_body_bytes_impl(
         drop_pod_refs,
         extra_refs,
         padded,
-    ) = match parse_result {
-        Ok(r) => r,
-        Err(e) => return Err(e),
-    };
+    ) = parse_result?;
     if padded {
         data.extend_from_slice(&[0, 0, 0, 0]);
     }

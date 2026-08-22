@@ -468,7 +468,7 @@ pub struct SaveStore {
 impl SaveStore {
     #[inline]
     pub fn s(&self, r: StrRef) -> String {
-        r.to_string(&self.data)
+        r.decode(&self.data)
     }
 
     pub fn has_object_model(&self) -> bool {

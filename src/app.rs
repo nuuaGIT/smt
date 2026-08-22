@@ -1,5 +1,5 @@
-use crate::localization::text;
-use crate::map::MapView;
+use crate::localization::{format_number, text};
+use crate::map::{draw_drawing_tool_icon, DrawingToolIcon, MapView};
 use crate::save_parser::parse_save_data;
 use crate::storage::{AppSettings, DiffSummary, Language, RefreshResult, SaveSnapshot, Storage};
 use eframe::egui;
@@ -139,6 +139,11 @@ pub struct TrackerApp {
     right_panel_edge_blocked: bool,
     loading: Option<LoadingState>,
     confirm_delete_all_smt_notes: bool,
+    auto_refresh_minutes: u32,
+    last_auto_refresh: Instant,
+    parse_started_at: Option<Instant>,
+    analysis_duration_ms: Option<u128>,
+    last_updated_at: Option<Instant>,
 }
 
 impl TrackerApp {
@@ -160,6 +165,11 @@ impl TrackerApp {
                 right_panel_edge_blocked: false,
                 loading: None,
                 confirm_delete_all_smt_notes: false,
+                auto_refresh_minutes: 8,
+                last_auto_refresh: Instant::now(),
+                parse_started_at: None,
+                analysis_duration_ms: None,
+                last_updated_at: None,
             },
             Err(error) => Self {
                 storage: None,
@@ -177,6 +187,11 @@ impl TrackerApp {
                 right_panel_edge_blocked: false,
                 loading: None,
                 confirm_delete_all_smt_notes: false,
+                auto_refresh_minutes: 8,
+                last_auto_refresh: Instant::now(),
+                parse_started_at: None,
+                analysis_duration_ms: None,
+                last_updated_at: None,
             },
         };
 
@@ -204,6 +219,7 @@ impl TrackerApp {
             rectangles,
             circles,
             arrows,
+            rulers,
             drawing_history,
             texts,
             strokes,
@@ -219,6 +235,7 @@ impl TrackerApp {
                     storage.active_rectangles(),
                     storage.active_circles(),
                     storage.active_arrows(),
+                    storage.active_rulers(),
                     storage.active_drawing_history(),
                     storage.active_texts(),
                     storage.active_strokes(),
@@ -229,6 +246,7 @@ impl TrackerApp {
         app.map.set_rectangles(rectangles);
         app.map.set_circles(circles);
         app.map.set_arrows(arrows);
+        app.map.set_rulers(rulers);
         app.map.set_drawing_history(drawing_history);
         app.map.set_texts(texts);
         app.map.set_strokes(strokes);
@@ -242,6 +260,7 @@ impl TrackerApp {
             settings.purity_filter,
             settings.only_claimed,
             settings.only_partial,
+            settings.only_planned,
         );
         app.map.set_selected_resources(settings.selected_resources);
         app.map.set_node_scale(settings.node_scale);
@@ -250,9 +269,11 @@ impl TrackerApp {
         app.map.set_show_rails(settings.show_rails);
         app.map.set_show_foundations(settings.show_foundations);
         app.map.set_show_belts(settings.show_belts);
+        app.map.set_use_svg_map(settings.use_svg_map);
         app.debug_mode = settings.debug_mode;
         app.pause_map_when_unfocused = settings.pause_map_when_unfocused;
         app.right_panel_width = settings.right_panel_width.clamp(8.0, 720.0);
+        app.auto_refresh_minutes = settings.auto_refresh_minutes.clamp(1, 120);
         app.loading = Some(LoadingState::new(MIN_FIRST_STARTUP_LOADING_TIME));
         app
     }
@@ -336,7 +357,7 @@ impl TrackerApp {
     }
 
     fn persist_settings(&mut self) {
-        let (resource_filter, purity_filter, only_claimed, only_partial) =
+        let (resource_filter, purity_filter, only_claimed, only_partial, only_planned) =
             self.map.filter_settings();
         let settings = AppSettings {
             show_node_names: self.map.show_node_names(),
@@ -351,10 +372,13 @@ impl TrackerApp {
             show_grid: self.map.show_grid(),
             show_annotations: self.map.show_annotations(),
             only_partial,
+            only_planned,
             show_rails: self.map.show_rails(),
             show_foundations: self.map.show_foundations(),
             show_belts: self.map.show_belts(),
+            use_svg_map: self.map.use_svg_map(),
             right_panel_width: self.right_panel_width.max(40.0),
+            auto_refresh_minutes: self.auto_refresh_minutes.clamp(1, 120),
         };
         if let Some(storage) = self.storage.as_mut() {
             if let Err(error) = storage.save_settings(settings) {
@@ -376,6 +400,7 @@ impl TrackerApp {
         self.map.set_rectangles(Vec::new());
         self.map.set_circles(Vec::new());
         self.map.set_arrows(Vec::new());
+        self.map.set_rulers(Vec::new());
         self.map.set_drawing_history(Vec::new());
         self.map.set_strokes(Vec::new());
         self.map.set_unclaimed_miner_tier(3);
@@ -385,6 +410,10 @@ impl TrackerApp {
         self.right_panel_generation = self.right_panel_generation.wrapping_add(1);
         self.status = text(self.language, "no_save").to_owned();
         self.error = None;
+        self.parse_started_at = None;
+        self.analysis_duration_ms = None;
+        self.last_updated_at = None;
+        self.last_auto_refresh = Instant::now();
         Ok(())
     }
 
@@ -403,6 +432,7 @@ impl TrackerApp {
         self.map.set_rectangles(Vec::new());
         self.map.set_circles(Vec::new());
         self.map.set_arrows(Vec::new());
+        self.map.set_rulers(Vec::new());
         self.map.set_texts(Vec::new());
         self.map.set_strokes(Vec::new());
         self.map.set_drawing_history(Vec::new());
@@ -415,6 +445,10 @@ impl TrackerApp {
         self.right_panel_generation = self.right_panel_generation.wrapping_add(1);
         self.status = text(self.language, "no_save").to_owned();
         self.error = None;
+        self.parse_started_at = None;
+        self.analysis_duration_ms = None;
+        self.last_updated_at = None;
+        self.last_auto_refresh = Instant::now();
         Ok(())
     }
 
@@ -452,6 +486,7 @@ impl TrackerApp {
                     rectangles,
                     circles,
                     arrows,
+                    rulers,
                     drawing_history,
                     texts,
                     strokes,
@@ -466,6 +501,7 @@ impl TrackerApp {
                             storage.active_rectangles(),
                             storage.active_circles(),
                             storage.active_arrows(),
+                            storage.active_rulers(),
                             storage.active_drawing_history(),
                             storage.active_texts(),
                             storage.active_strokes(),
@@ -478,10 +514,12 @@ impl TrackerApp {
                 self.map.set_rectangles(rectangles);
                 self.map.set_circles(circles);
                 self.map.set_arrows(arrows);
+                self.map.set_rulers(rulers);
                 self.map.set_drawing_history(drawing_history);
                 self.map.set_texts(texts);
                 self.map.set_strokes(strokes);
                 self.map.set_play_duration_in_seconds(0);
+                self.last_auto_refresh = Instant::now();
                 self.start_loading_screen();
                 self.start_parse(path);
             }
@@ -490,6 +528,7 @@ impl TrackerApp {
     }
 
     fn refresh_save(&mut self) {
+        self.last_auto_refresh = Instant::now();
         self.start_loading_screen();
         let result = match self.storage.as_mut() {
             Some(storage) => storage.refresh(),
@@ -500,6 +539,7 @@ impl TrackerApp {
             Ok(RefreshResult::Unchanged) => {
                 self.error = None;
                 self.status = text(self.language, "no_changes").to_owned();
+                self.last_updated_at = Some(Instant::now());
             }
             Ok(RefreshResult::Updated(diff)) => {
                 self.error = None;
@@ -516,9 +556,49 @@ impl TrackerApp {
         }
     }
 
+    fn auto_refresh_if_due(&mut self, context: &egui::Context) {
+        let has_source_save = self
+            .storage
+            .as_ref()
+            .and_then(|storage| storage.state.source_path.as_ref())
+            .is_some_and(|path| path.exists());
+        if !has_source_save {
+            return;
+        }
+
+        let interval = Duration::from_secs(u64::from(self.auto_refresh_minutes.max(1)) * 60);
+        let elapsed = self.last_auto_refresh.elapsed();
+        if elapsed >= interval && self.parse_receiver.is_none() && self.loading.is_none() {
+            self.refresh_save();
+            return;
+        }
+
+        let until_refresh = interval.saturating_sub(elapsed);
+        context.request_repaint_after(until_refresh.min(Duration::from_secs(1)));
+    }
+
+    fn header_status(&self) -> String {
+        if self.parse_receiver.is_some() {
+            return self.status.clone();
+        }
+        if let (Some(duration_ms), Some(last_updated)) =
+            (self.analysis_duration_ms, self.last_updated_at)
+        {
+            return format!(
+                "{}: {} ms · {}: {}",
+                text(self.language, "analysis_duration"),
+                format_number(self.language, duration_ms as f64, 0),
+                text(self.language, "last_updated"),
+                format_time_ago(self.language, last_updated)
+            );
+        }
+        self.status.clone()
+    }
+
     fn start_parse(&mut self, path: PathBuf) {
         let (sender, receiver) = mpsc::channel();
         self.parse_receiver = Some(receiver);
+        self.parse_started_at = Some(Instant::now());
         self.status = text(self.language, "analyzing_save").to_owned();
 
         thread::spawn(move || {
@@ -534,6 +614,11 @@ impl TrackerApp {
 
         match receiver.try_recv() {
             Ok(Ok(save_data)) => {
+                self.analysis_duration_ms = self
+                    .parse_started_at
+                    .take()
+                    .map(|started| started.elapsed().as_millis());
+                self.last_updated_at = Some(Instant::now());
                 let (matched, total) = self.map.apply_extractors(&save_data.extractors);
                 self.map.replace_map_layers(
                     save_data.rails,
@@ -543,13 +628,15 @@ impl TrackerApp {
                 self.map
                     .set_play_duration_in_seconds(save_data.play_duration_in_seconds);
                 self.status = format!(
-                    "{}: {matched}/{total} extractors · {} {} · {} {} · {} {}",
+                    "{}: {}/{} extractors · {} {} · {} {} · {} {}",
                     text(self.language, "save_analyzed"),
-                    format_meters(self.map.rail_length_meters()),
+                    format_number(self.language, matched as f64, 0),
+                    format_number(self.language, total as f64, 0),
+                    format_meters(self.language, self.map.rail_length_meters()),
                     text(self.language, "rails"),
-                    self.map.foundation_count(),
+                    format_number(self.language, self.map.foundation_count() as f64, 0),
                     text(self.language, "foundation_count"),
-                    format_meters(self.map.belt_length_meters()),
+                    format_meters(self.language, self.map.belt_length_meters()),
                     text(self.language, "belt_count"),
                 );
                 self.error = None;
@@ -584,6 +671,7 @@ impl eframe::App for TrackerApp {
         }
 
         self.poll_parse();
+        self.auto_refresh_if_due(context);
         if self.parse_receiver.is_some() {
             let repaint_delay = if viewport.minimized.unwrap_or(false) {
                 std::time::Duration::from_secs(2)
@@ -599,180 +687,229 @@ impl eframe::App for TrackerApp {
             return;
         }
 
-        egui::TopBottomPanel::top("toolbar").show(context, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button(text(self.language, "upload_save")).clicked() {
-                    self.choose_save();
-                }
-
-                let can_refresh = self
-                    .storage
-                    .as_ref()
-                    .and_then(|storage| storage.state.source_path.as_ref())
-                    .is_some();
-                if ui
-                    .add_enabled(
-                        can_refresh,
-                        egui::Button::new(text(self.language, "refresh")),
-                    )
-                    .clicked()
-                {
-                    self.refresh_save();
-                }
-
-                let can_clear_save = self
-                    .storage
-                    .as_ref()
-                    .is_some_and(|storage| storage.state.source_path.is_some());
-                if ui
-                    .add_enabled(
-                        can_clear_save,
-                        egui::Button::new(text(self.language, "remove_save")),
-                    )
-                    .clicked()
-                {
-                    if let Err(error) = self.clear_active_save() {
-                        self.error = Some(error);
-                    } else {
-                        context.request_repaint();
+        egui::TopBottomPanel::top("toolbar")
+            .frame(
+                egui::Frame::side_top_panel(&context.style())
+                    .inner_margin(egui::Margin::symmetric(8.0, 1.0)),
+            )
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(text(self.language, "upload_save")).clicked() {
+                        self.choose_save();
                     }
-                }
 
-                let mut settings_changed = false;
-                ui.menu_button(text(self.language, "settings"), |ui| {
-                    self.map.filters(ui);
-                    ui.separator();
+                    let can_refresh = self
+                        .storage
+                        .as_ref()
+                        .and_then(|storage| storage.state.source_path.as_ref())
+                        .is_some();
+                    if ui
+                        .add_enabled(
+                            can_refresh,
+                            egui::Button::new(text(self.language, "refresh")),
+                        )
+                        .clicked()
+                    {
+                        self.refresh_save();
+                    }
 
-                    let mut language = self.language;
-                    egui::ComboBox::from_label(text(self.language, "language"))
-                        .selected_text(language.native_name())
-                        .show_ui(ui, |ui| {
-                            for candidate in [
-                                Language::English,
-                                Language::German,
-                                Language::French,
-                                Language::Spanish,
-                            ] {
-                                ui.selectable_value(
-                                    &mut language,
-                                    candidate,
-                                    candidate.native_name(),
+                    let mut settings_changed = false;
+                    ui.menu_button(text(self.language, "settings"), |ui| {
+                        egui::CollapsingHeader::new(text(self.language, "settings_application"))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let mut language = self.language;
+                                egui::ComboBox::from_label(text(self.language, "language"))
+                                    .selected_text(language.native_name())
+                                    .show_ui(ui, |ui| {
+                                        for candidate in [
+                                            Language::English,
+                                            Language::German,
+                                            Language::French,
+                                            Language::Spanish,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut language,
+                                                candidate,
+                                                candidate.native_name(),
+                                            );
+                                        }
+                                    });
+                                if language != self.language {
+                                    self.language = language;
+                                    self.map.set_language(language);
+                                    settings_changed = true;
+                                }
+                            });
+
+                        egui::CollapsingHeader::new(text(self.language, "settings_map"))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.map.filters(ui);
+                                let mut show_names = self.map.show_node_names();
+                                if ui
+                                    .checkbox(&mut show_names, text(self.language, "node_names"))
+                                    .changed()
+                                {
+                                    self.map.set_show_node_names(show_names);
+                                    settings_changed = true;
+                                }
+                                let mut node_scale = self.map.node_scale();
+                                let node_scale_label = format!(
+                                    "{} {}%",
+                                    text(self.language, "node_size"),
+                                    format_number(self.language, (node_scale * 100.0) as f64, 0)
                                 );
-                            }
-                        });
-                    if language != self.language {
-                        self.language = language;
-                        self.map.set_language(language);
-                        settings_changed = true;
-                    }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut node_scale, 0.5..=1.5)
+                                            .text(node_scale_label),
+                                    )
+                                    .changed()
+                                {
+                                    self.map.set_node_scale(node_scale);
+                                    settings_changed = true;
+                                }
+                            });
 
-                    let mut show_names = self.map.show_node_names();
-                    if ui
-                        .checkbox(&mut show_names, text(self.language, "node_names"))
-                        .changed()
-                    {
-                        self.map.set_show_node_names(show_names);
-                        settings_changed = true;
-                    }
-                    if ui
-                        .checkbox(&mut self.debug_mode, text(self.language, "debug_mode"))
-                        .changed()
-                    {
-                        settings_changed = true;
-                    }
-                    if ui
-                        .checkbox(
-                            &mut self.pause_map_when_unfocused,
-                            text(self.language, "pause_background"),
-                        )
-                        .changed()
-                    {
-                        settings_changed = true;
-                    }
-                    let mut show_annotations = self.map.show_annotations();
-                    if ui
-                        .checkbox(
-                            &mut show_annotations,
-                            text(self.language, "show_annotations"),
-                        )
-                        .changed()
-                    {
-                        self.map.set_show_annotations(show_annotations);
-                        settings_changed = true;
-                    }
-                    ui.collapsing("Testing stuff", |ui| {
-                        let mut show_rails = self.map.show_rails();
-                        if ui
-                            .checkbox(&mut show_rails, text(self.language, "rails_wip"))
-                            .changed()
-                        {
-                            self.map.set_show_rails(show_rails);
-                            settings_changed = true;
-                        }
-                        let mut show_foundations = self.map.show_foundations();
-                        if ui
-                            .checkbox(
-                                &mut show_foundations,
-                                text(self.language, "show_foundations"),
-                            )
-                            .changed()
-                        {
-                            self.map.set_show_foundations(show_foundations);
-                            settings_changed = true;
-                        }
-                        let mut show_belts = self.map.show_belts();
-                        if ui
-                            .checkbox(&mut show_belts, text(self.language, "show_belts"))
-                            .changed()
-                        {
-                            self.map.set_show_belts(show_belts);
-                            settings_changed = true;
-                        }
+                        egui::CollapsingHeader::new(text(self.language, "settings_display"))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let mut show_annotations = self.map.show_annotations();
+                                if ui
+                                    .checkbox(
+                                        &mut show_annotations,
+                                        text(self.language, "show_annotations"),
+                                    )
+                                    .changed()
+                                {
+                                    self.map.set_show_annotations(show_annotations);
+                                    settings_changed = true;
+                                }
+                                if ui
+                                    .checkbox(
+                                        &mut self.debug_mode,
+                                        text(self.language, "debug_mode"),
+                                    )
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                }
+                                if ui
+                                    .checkbox(
+                                        &mut self.pause_map_when_unfocused,
+                                        text(self.language, "pause_background"),
+                                    )
+                                    .changed()
+                                {
+                                    settings_changed = true;
+                                }
+                                let mut auto_refresh_minutes = self.auto_refresh_minutes;
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut auto_refresh_minutes, 1..=120)
+                                            .text(text(self.language, "auto_refresh")),
+                                    )
+                                    .changed()
+                                {
+                                    self.auto_refresh_minutes = auto_refresh_minutes;
+                                    self.last_auto_refresh = Instant::now();
+                                    settings_changed = true;
+                                }
+                                ui.small(text(self.language, "background_throttle"));
+
+                                let mut use_detailed_png_map = !self.map.use_svg_map();
+                                if ui
+                                    .checkbox(
+                                        &mut use_detailed_png_map,
+                                        text(self.language, "detailed_png_map"),
+                                    )
+                                    .changed()
+                                {
+                                    self.map.set_use_svg_map(!use_detailed_png_map);
+                                    self.start_loading_screen();
+                                    settings_changed = true;
+                                }
+                            });
+
+                        egui::CollapsingHeader::new(text(self.language, "settings_testing"))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mut show_rails = self.map.show_rails();
+                                if ui
+                                    .checkbox(&mut show_rails, text(self.language, "rails_wip"))
+                                    .changed()
+                                {
+                                    self.map.set_show_rails(show_rails);
+                                    settings_changed = true;
+                                }
+                                let mut show_foundations = self.map.show_foundations();
+                                if ui
+                                    .checkbox(
+                                        &mut show_foundations,
+                                        text(self.language, "show_foundations"),
+                                    )
+                                    .changed()
+                                {
+                                    self.map.set_show_foundations(show_foundations);
+                                    settings_changed = true;
+                                }
+                                let mut show_belts = self.map.show_belts();
+                                if ui
+                                    .checkbox(&mut show_belts, text(self.language, "show_belts"))
+                                    .changed()
+                                {
+                                    self.map.set_show_belts(show_belts);
+                                    settings_changed = true;
+                                }
+                            });
+
+                        egui::CollapsingHeader::new(text(self.language, "more"))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if ui
+                                    .button(text(self.language, "delete_all_smt_notes"))
+                                    .clicked()
+                                {
+                                    self.confirm_delete_all_smt_notes = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("CLICK ME").clicked() {
+                                    ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                        "https://youtu.be/dQw4w9WgXcQ",
+                                    ));
+                                }
+                            });
                     });
-                    ui.collapsing(text(self.language, "more"), |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_clear_save = self
+                            .storage
+                            .as_ref()
+                            .is_some_and(|storage| storage.state.source_path.is_some());
                         if ui
-                            .button(text(self.language, "delete_all_smt_notes"))
+                            .add_enabled(
+                                can_clear_save,
+                                egui::Button::new(text(self.language, "remove_save")),
+                            )
                             .clicked()
                         {
-                            self.confirm_delete_all_smt_notes = true;
-                            ui.close_menu();
+                            if let Err(error) = self.clear_active_save() {
+                                self.error = Some(error);
+                            } else {
+                                context.request_repaint();
+                            }
                         }
+                        ui.separator();
+                        ui.small(self.header_status());
                     });
-                    let mut node_scale = self.map.node_scale();
-                    let node_scale_label = format!(
-                        "{} {:.0}%",
-                        text(self.language, "node_size"),
-                        node_scale * 100.0
-                    );
-                    if ui
-                        .add(egui::Slider::new(&mut node_scale, 0.5..=1.5).text(node_scale_label))
-                        .changed()
-                    {
-                        self.map.set_node_scale(node_scale);
+                    if self.map.take_filter_settings_changed() {
                         settings_changed = true;
                     }
-                    ui.separator();
-                    ui.small(text(self.language, "background_throttle"));
-                    if ui.button("CLICK ME").clicked() {
-                        ui.ctx()
-                            .open_url(egui::OpenUrl::new_tab("https://youtu.be/dQw4w9WgXcQ"));
+                    if settings_changed {
+                        self.persist_settings();
                     }
                 });
-                if self.map.take_filter_settings_changed() {
-                    settings_changed = true;
-                }
-                if settings_changed {
-                    self.persist_settings();
-                }
-                ui.label(&self.status);
-                ui.separator();
-                ui.small(format!(
-                    "{}: {}",
-                    text(self.language, "playtime"),
-                    format_playtime(self.map.play_duration_in_seconds())
-                ));
             });
-        });
 
         if self.confirm_delete_all_smt_notes {
             let mut delete = false;
@@ -811,41 +948,46 @@ impl eframe::App for TrackerApp {
             .as_ref()
             .and_then(|storage| storage.state.source_path.as_ref())
             .cloned();
-        egui::TopBottomPanel::top("save-info-bar").show(context, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let save_name = save_path
-                    .as_ref()
-                    .and_then(|path| path.file_name())
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("—");
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}: {save_name}",
-                        text(self.language, "save_file")
-                    ))
-                    .color(egui::Color32::WHITE)
-                    .strong(),
-                );
-                ui.separator();
-                ui.label(format!(
-                    "{} {} · {} {}",
-                    self.map.nodes.len(),
-                    text(self.language, "resource_nodes"),
-                    self.map.claimed_node_count(),
-                    text(self.language, "claimed_nodes")
-                ));
-                ui.separator();
-                ui.label(format!(
-                    "{}: {} · {}: {} · {}: {}",
-                    text(self.language, "belts_laid"),
-                    format_meters(self.map.belt_length_meters()),
-                    text(self.language, "rails_laid"),
-                    format_meters(self.map.rail_length_meters()),
-                    text(self.language, "playtime"),
-                    format_playtime(self.map.play_duration_in_seconds())
-                ));
+        egui::TopBottomPanel::top("save-info-bar")
+            .frame(
+                egui::Frame::side_top_panel(&context.style())
+                    .inner_margin(egui::Margin::symmetric(8.0, 1.0)),
+            )
+            .show(context, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let save_name = save_path
+                        .as_ref()
+                        .and_then(|path| path.file_name())
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("—");
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}: {save_name}",
+                            text(self.language, "save_file")
+                        ))
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                    );
+                    ui.separator();
+                    ui.label(format!(
+                        "{} {} · {} {}",
+                        format_number(self.language, self.map.nodes.len() as f64, 0),
+                        text(self.language, "resource_nodes"),
+                        format_number(self.language, self.map.claimed_node_count() as f64, 0),
+                        text(self.language, "claimed_nodes")
+                    ));
+                    ui.separator();
+                    ui.label(format!(
+                        "{}: {} · {}: {} · {}: {}",
+                        text(self.language, "belts_laid"),
+                        format_meters(self.language, self.map.belt_length_meters()),
+                        text(self.language, "rails_laid"),
+                        format_meters(self.language, self.map.rail_length_meters()),
+                        text(self.language, "playtime"),
+                        format_playtime(self.language, self.map.play_duration_in_seconds())
+                    ));
+                });
             });
-        });
 
         let screen_rect = context.screen_rect();
         let pointer_at_right_edge = context.input(|input| {
@@ -947,220 +1089,227 @@ impl eframe::App for TrackerApp {
             self.persist_settings();
         }
 
-        egui::CentralPanel::default().show(context, |ui| {
-            let has_source_save = self
-                .storage
-                .as_ref()
-                .is_some_and(|storage| storage.state.source_path.is_some());
-            ui.horizontal(|ui| {
-                ui.heading(text(self.language, "app_title"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let drawing_label = if self.map.rectangle_tool_active() {
-                        text(self.language, "cancel_rectangle")
-                    } else {
-                        text(self.language, "draw_rectangle")
-                    };
-                    if ui
-                        .add_enabled(
-                            has_source_save,
-                            egui::Button::new(drawing_label).min_size(egui::vec2(150.0, 0.0)),
-                        )
-                        .clicked()
-                    {
-                        self.map.toggle_rectangle_tool();
-                        context.request_repaint();
-                    }
-                    let circle_label = if self.map.circle_tool_active() {
-                        text(self.language, "cancel_circle")
-                    } else {
-                        text(self.language, "draw_circle")
-                    };
-                    if ui
-                        .add_enabled(
-                            has_source_save,
-                            egui::Button::new(circle_label).min_size(egui::vec2(130.0, 0.0)),
-                        )
-                        .clicked()
-                    {
-                        self.map.toggle_circle_tool();
-                        context.request_repaint();
-                    }
-                    let arrow_label = if self.map.arrow_tool_active() {
-                        text(self.language, "cancel_arrow")
-                    } else {
-                        text(self.language, "draw_arrow")
-                    };
-                    if ui
-                        .add_enabled(
-                            has_source_save,
-                            egui::Button::new(arrow_label).min_size(egui::vec2(120.0, 0.0)),
-                        )
-                        .clicked()
-                    {
-                        self.map.toggle_arrow_tool();
-                        context.request_repaint();
-                    }
-                    let text_label = if self.map.text_tool_active() {
-                        text(self.language, "cancel_text")
-                    } else {
-                        text(self.language, "draw_text")
-                    };
-                    if ui
-                        .add_enabled(
-                            has_source_save,
-                            egui::Button::new(text_label).min_size(egui::vec2(120.0, 0.0)),
-                        )
-                        .clicked()
-                    {
-                        self.map.toggle_text_tool();
-                        context.request_repaint();
-                    }
-                    let eraser_label = if self.map.eraser_tool_active() {
-                        text(self.language, "cancel_eraser")
-                    } else {
-                        text(self.language, "draw_eraser")
-                    };
-                    if ui
-                        .add_enabled(
-                            has_source_save,
-                            egui::Button::new(eraser_label).min_size(egui::vec2(110.0, 0.0)),
-                        )
-                        .clicked()
-                    {
-                        self.map.toggle_eraser_tool();
-                        context.request_repaint();
-                    }
-                    let pen_label = if self.map.pen_tool_active() {
-                        text(self.language, "cancel_pen")
-                    } else {
-                        text(self.language, "draw_pen")
-                    };
-                    if ui
-                        .add_enabled(
-                            has_source_save,
-                            egui::Button::new(pen_label).min_size(egui::vec2(100.0, 0.0)),
-                        )
-                        .clicked()
-                    {
-                        self.map.toggle_pen_tool();
-                        context.request_repaint();
-                    }
-                });
-            });
-            ui.add_space(16.0);
-
-            if let Some(error) = &self.error {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 80),
-                        text(self.language, "error"),
-                    );
-                    ui.label(error);
-                });
-                ui.add_space(12.0);
-            }
-
-            if self.storage.is_none() {
-                ui.label(text(self.language, "not_initialized"));
-                return;
-            }
-
-            if !has_source_save {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.weak(text(self.language, "no_save"));
-                        ui.small(text(self.language, "upload_hint"));
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(&context.style())
+                    .inner_margin(egui::Margin::symmetric(8.0, 1.0)),
+            )
+            .show(context, |ui| {
+                let has_source_save = self
+                    .storage
+                    .as_ref()
+                    .is_some_and(|storage| storage.state.source_path.is_some());
+                ui.horizontal(|ui| {
+                    ui.heading(text(self.language, "app_title"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.vertical(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(text(self.language, "drawing_toolbar"))
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                },
+                            );
+                            ui.add_space(2.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.rectangle_tool_active(),
+                                    DrawingToolIcon::Rectangle,
+                                    text(self.language, "tool_rectangle"),
+                                ) {
+                                    self.map.toggle_rectangle_tool();
+                                    context.request_repaint();
+                                }
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.circle_tool_active(),
+                                    DrawingToolIcon::Circle,
+                                    text(self.language, "tool_circle"),
+                                ) {
+                                    self.map.toggle_circle_tool();
+                                    context.request_repaint();
+                                }
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.arrow_tool_active(),
+                                    DrawingToolIcon::Arrow,
+                                    text(self.language, "tool_arrow"),
+                                ) {
+                                    self.map.toggle_arrow_tool();
+                                    context.request_repaint();
+                                }
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.ruler_tool_active(),
+                                    DrawingToolIcon::Ruler,
+                                    text(self.language, "tool_ruler"),
+                                ) {
+                                    self.map.toggle_ruler_tool();
+                                    context.request_repaint();
+                                }
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.text_tool_active(),
+                                    DrawingToolIcon::Text,
+                                    text(self.language, "tool_text"),
+                                ) {
+                                    self.map.toggle_text_tool();
+                                    context.request_repaint();
+                                }
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.eraser_tool_active(),
+                                    DrawingToolIcon::Eraser,
+                                    text(self.language, "tool_eraser"),
+                                ) {
+                                    self.map.toggle_eraser_tool();
+                                    context.request_repaint();
+                                }
+                                if toolbar_tool(
+                                    ui,
+                                    has_source_save,
+                                    self.map.pen_tool_active(),
+                                    DrawingToolIcon::Pen,
+                                    text(self.language, "tool_pen"),
+                                ) {
+                                    self.map.toggle_pen_tool();
+                                    context.request_repaint();
+                                }
+                            });
+                        });
                     });
                 });
-            } else if app_in_background && self.pause_map_when_unfocused {
-                ui.centered_and_justified(|ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.weak(text(self.language, "map_paused"));
-                        ui.small(text(self.language, "change_in_settings"));
-                    });
-                });
-            } else {
-                self.map.canvas(ui);
-            }
+                ui.add_space(0.0);
 
-            if let Some(allocations) = self.map.take_allocation_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    match storage.save_node_allocations(allocations) {
-                        Ok(()) => {
-                            self.status = text(self.language, "node_data_saved").to_owned();
-                            self.error = None;
+                if let Some(error) = &self.error {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 80, 80),
+                            text(self.language, "error"),
+                        );
+                        ui.label(error);
+                    });
+                    ui.add_space(12.0);
+                }
+
+                if self.storage.is_none() {
+                    ui.label(text(self.language, "not_initialized"));
+                    return;
+                }
+
+                if !has_source_save {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.weak(text(self.language, "no_save"));
+                            ui.small(text(self.language, "upload_hint"));
+                        });
+                    });
+                } else if app_in_background && self.pause_map_when_unfocused {
+                    ui.centered_and_justified(|ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.weak(text(self.language, "map_paused"));
+                            ui.small(text(self.language, "change_in_settings"));
+                        });
+                    });
+                } else {
+                    self.map.canvas(ui);
+                }
+
+                if let Some(allocations) = self.map.take_allocation_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        match storage.save_node_allocations(allocations) {
+                            Ok(()) => {
+                                self.status = text(self.language, "node_data_saved").to_owned();
+                                self.error = None;
+                            }
+                            Err(error) => self.error = Some(error.to_string()),
                         }
-                        Err(error) => self.error = Some(error.to_string()),
                     }
                 }
-            }
 
-            if let Some(rectangles) = self.map.take_rectangle_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    if let Err(error) = storage.save_active_rectangles(rectangles) {
-                        self.error = Some(error.to_string());
+                if let Some(rectangles) = self.map.take_rectangle_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_rectangles(rectangles) {
+                            self.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
-            if let Some(circles) = self.map.take_circle_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    if let Err(error) = storage.save_active_circles(circles) {
-                        self.error = Some(error.to_string());
+                if let Some(circles) = self.map.take_circle_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_circles(circles) {
+                            self.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
-            if let Some(arrows) = self.map.take_arrow_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    if let Err(error) = storage.save_active_arrows(arrows) {
-                        self.error = Some(error.to_string());
+                if let Some(arrows) = self.map.take_arrow_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_arrows(arrows) {
+                            self.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
-            if let Some(history) = self.map.take_drawing_history_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    if let Err(error) = storage.save_active_drawing_history(history) {
-                        self.error = Some(error.to_string());
+                if let Some(rulers) = self.map.take_ruler_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_rulers(rulers) {
+                            self.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
-            if let Some(texts) = self.map.take_text_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    if let Err(error) = storage.save_active_texts(texts) {
-                        self.error = Some(error.to_string());
+                if let Some(history) = self.map.take_drawing_history_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_drawing_history(history) {
+                            self.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
-            if let Some(strokes) = self.map.take_stroke_save() {
-                if let Some(storage) = self.storage.as_mut() {
-                    if let Err(error) = storage.save_active_strokes(strokes) {
-                        self.error = Some(error.to_string());
+                if let Some(texts) = self.map.take_text_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_texts(texts) {
+                            self.error = Some(error.to_string());
+                        }
                     }
                 }
-            }
+                if let Some(strokes) = self.map.take_stroke_save() {
+                    if let Some(storage) = self.storage.as_mut() {
+                        if let Err(error) = storage.save_active_strokes(strokes) {
+                            self.error = Some(error.to_string());
+                        }
+                    }
+                }
 
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new(text(self.language, "save_status"))
-                .default_open(false)
-                .show(ui, |ui| {
-                    let Some(storage) = self.storage.as_ref() else {
-                        return;
-                    };
-                    if let Some(snapshot) = &storage.state.current_snapshot {
-                        snapshot_view(ui, snapshot);
-                    } else {
-                        ui.label(text(self.language, "no_saved_save"));
-                    }
-                    if let Some(diff) = &storage.state.last_diff {
-                        ui.separator();
-                        diff_view(ui, diff);
-                    }
-                    ui.label(format!(
-                        "{}: {}",
-                        text(self.language, "local_copy"),
-                        storage.active_save_path().display()
-                    ));
-                });
-        });
+                ui.add_space(12.0);
+                egui::CollapsingHeader::new(text(self.language, "save_status"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let Some(storage) = self.storage.as_ref() else {
+                            return;
+                        };
+                        if let Some(snapshot) = &storage.state.current_snapshot {
+                            snapshot_view(ui, snapshot, self.language);
+                        } else {
+                            ui.label(text(self.language, "no_saved_save"));
+                        }
+                        if let Some(diff) = &storage.state.last_diff {
+                            ui.separator();
+                            diff_view(ui, diff, self.language);
+                        }
+                        ui.label(format!(
+                            "{}: {}",
+                            text(self.language, "local_copy"),
+                            storage.active_save_path().display()
+                        ));
+                    });
+            });
 
         if self.debug_mode {
             let stable_dt = context.input(|input| input.stable_dt.max(f32::EPSILON));
@@ -1180,14 +1329,16 @@ impl eframe::App for TrackerApp {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.set_min_width(270.0);
                         ui.monospace(format!(
-                            "FPS: {:.1} · Frame: {:.2} ms",
-                            1.0 / stable_dt,
-                            stable_dt * 1000.0
+                            "FPS: {} · Frame: {} ms",
+                            format_number(self.language, (1.0 / stable_dt) as f64, 1),
+                            format_number(self.language, (stable_dt * 1000.0) as f64, 2)
                         ));
                         ui.monospace(format!(
                             "CPU letzter Frame: {}",
                             cpu_usage
-                                .map(|value| format!("{value:.1}%"))
+                                .map(|value| {
+                                    format!("{}%", format_number(self.language, value as f64, 1))
+                                })
                                 .unwrap_or_else(|| "n/a".to_owned())
                         ));
                         ui.monospace(format!(
@@ -1197,25 +1348,25 @@ impl eframe::App for TrackerApp {
                         ));
                         ui.monospace(format!(
                             "Nodes: {} total · {} claimed · {} sichtbar",
-                            self.map.nodes.len(),
-                            self.map.claimed_node_count(),
-                            self.map.visible_node_count()
+                            format_number(self.language, self.map.nodes.len() as f64, 0),
+                            format_number(self.language, self.map.claimed_node_count() as f64, 0),
+                            format_number(self.language, self.map.visible_node_count() as f64, 0)
                         ));
                         ui.monospace(format!(
                             "Schienen: {} · {} Segmente",
-                            format_meters(self.map.rail_length_meters()),
-                            self.map.rail_count()
+                            format_meters(self.language, self.map.rail_length_meters()),
+                            format_number(self.language, self.map.rail_count() as f64, 0)
                         ));
                         ui.monospace(format!(
                             "Layer: {} Foundations · {} Belts · {}",
-                            self.map.foundation_count(),
-                            self.map.belt_count(),
-                            format_meters(self.map.belt_length_meters())
+                            format_number(self.language, self.map.foundation_count() as f64, 0),
+                            format_number(self.language, self.map.belt_count() as f64, 0),
+                            format_meters(self.language, self.map.belt_length_meters())
                         ));
                         ui.monospace(format!(
-                            "Zoom: {:.2}x · Node-Größe: {:.0}%",
-                            self.map.zoom_level(),
-                            self.map.node_scale() * 100.0
+                            "Zoom: {}x · Node-Größe: {}%",
+                            format_number(self.language, self.map.zoom_level() as f64, 2),
+                            format_number(self.language, (self.map.node_scale() * 100.0) as f64, 0)
                         ));
                         ui.monospace(format!(
                             "Parser: {}",
@@ -1227,9 +1378,9 @@ impl eframe::App for TrackerApp {
                         ));
                         if let Some(rect) = viewport_size {
                             ui.monospace(format!(
-                                "Viewport: {:.0} x {:.0}",
-                                rect.width(),
-                                rect.height()
+                                "Viewport: {} x {}",
+                                format_number(self.language, rect.width() as f64, 0),
+                                format_number(self.language, rect.height() as f64, 0)
                             ));
                         }
                         ui.small(format!("Quelle: {save_path}"));
@@ -1277,18 +1428,91 @@ fn apply_flat_ui_style(context: &egui::Context) {
     context.set_style(style);
 }
 
-fn snapshot_view(ui: &mut egui::Ui, snapshot: &SaveSnapshot) {
+fn toolbar_tool(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    active: bool,
+    icon: DrawingToolIcon,
+    name: &'static str,
+) -> bool {
+    ui.allocate_ui_with_layout(
+        egui::vec2(58.0, 53.0),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let clicked = toolbar_button(ui, enabled, active, icon, name);
+            ui.label(egui::RichText::new(name).size(9.0).color(if enabled {
+                egui::Color32::from_rgb(0xD2, 0xD6, 0xD9)
+            } else {
+                egui::Color32::from_rgb(0x6A, 0x73, 0x78)
+            }));
+            clicked
+        },
+    )
+    .inner
+}
+
+fn toolbar_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    active: bool,
+    icon: DrawingToolIcon,
+    tooltip: &'static str,
+) -> bool {
+    let accent = egui::Color32::from_rgb(0x4B, 0xB4, 0xCE);
+    let button = egui::Button::new(egui::RichText::new(" "))
+        .min_size(egui::vec2(40.0, 40.0))
+        .fill(if active {
+            accent.gamma_multiply(0.28)
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            if active {
+                accent
+            } else {
+                egui::Color32::from_rgb(0x5F, 0x6D, 0x76)
+            },
+        ));
+    let response = ui.add_enabled(enabled, button);
+    let icon_color = if !enabled {
+        egui::Color32::from_rgb(0x6A, 0x73, 0x78)
+    } else if active {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::from_rgb(0xD2, 0xD6, 0xD9)
+    };
+    draw_drawing_tool_icon(ui.painter(), response.rect.center(), icon, icon_color);
+    let clicked = response.clicked();
+    response.on_hover_text(tooltip);
+    clicked
+}
+
+fn snapshot_view(ui: &mut egui::Ui, snapshot: &SaveSnapshot, language: Language) {
     ui.label(format!("Datei: {}", snapshot.file_name));
-    ui.label(format!("Größe: {} Bytes", snapshot.byte_length));
+    ui.label(format!(
+        "Größe: {} Bytes",
+        format_number(language, snapshot.byte_length as f64, 0)
+    ));
     ui.label("SHA-256:");
     ui.add(egui::Label::new(egui::RichText::new(&snapshot.sha256).monospace()).wrap());
 }
 
-fn diff_view(ui: &mut egui::Ui, diff: &DiffSummary) {
-    ui.label(format!("Geänderte Bytes: {}", diff.changed_bytes));
-    ui.label(format!("Geänderte Bereiche: {}", diff.changed_ranges));
+fn diff_view(ui: &mut egui::Ui, diff: &DiffSummary, language: Language) {
+    ui.label(format!(
+        "Geänderte Bytes: {}",
+        format_number(language, diff.changed_bytes as f64, 0)
+    ));
+    ui.label(format!(
+        "Geänderte Bereiche: {}",
+        format_number(language, diff.changed_ranges as f64, 0)
+    ));
     if let Some(offset) = diff.first_changed_offset {
-        ui.label(format!("Erster Unterschied bei Byte {}", offset));
+        ui.label(format!(
+            "Erster Unterschied bei Byte {}",
+            format_number(language, offset as f64, 0)
+        ));
     }
 }
 
@@ -1296,28 +1520,55 @@ fn format_diff_status(language: Language, diff: &DiffSummary) -> String {
     format!(
         "{}: {} bytes in {} ranges changed",
         text(language, "save_updated"),
-        diff.changed_bytes,
-        diff.changed_ranges
+        format_number(language, diff.changed_bytes as f64, 0),
+        format_number(language, diff.changed_ranges as f64, 0)
     )
 }
 
-fn format_meters(value: f32) -> String {
+fn format_meters(language: Language, value: f32) -> String {
     let meters = value.max(0.0).round() as u64;
-    let digits = meters.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (index, character) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            grouped.push('.');
-        }
-        grouped.push(character);
-    }
-    format!("{grouped} m")
+    format!("{} m", format_number(language, meters as f64, 0))
 }
 
-fn format_playtime(seconds: u32) -> String {
+fn format_playtime(language: Language, seconds: u32) -> String {
     let hours = seconds / 3_600;
     let minutes = (seconds % 3_600) / 60;
-    format!("{hours}h {minutes}min")
+    format!(
+        "{}h {}min",
+        format_number(language, hours as f64, 0),
+        format_number(language, minutes as f64, 0)
+    )
+}
+
+fn format_time_ago(language: Language, updated_at: Instant) -> String {
+    let seconds = updated_at.elapsed().as_secs();
+    if seconds < 60 {
+        let seconds_text = format_number(language, seconds as f64, 0);
+        return match language {
+            Language::English => format!("{seconds_text}s ago"),
+            Language::German => format!("vor {seconds_text}s"),
+            Language::French => format!("il y a {seconds_text}s"),
+            Language::Spanish => format!("hace {seconds_text}s"),
+        };
+    }
+    let minutes = seconds / 60;
+    let minutes_text = format_number(language, minutes as f64, 0);
+    if minutes < 60 {
+        return match language {
+            Language::English => format!("{minutes_text}m ago"),
+            Language::German => format!("vor {minutes_text}min"),
+            Language::French => format!("il y a {minutes_text}min"),
+            Language::Spanish => format!("hace {minutes_text}min"),
+        };
+    }
+    let hours = minutes / 60;
+    let hours_text = format_number(language, hours as f64, 0);
+    match language {
+        Language::English => format!("{hours_text}h ago"),
+        Language::German => format!("vor {hours_text}h"),
+        Language::French => format!("il y a {hours_text}h"),
+        Language::Spanish => format!("hace {hours_text}h"),
+    }
 }
 
 #[cfg(test)]

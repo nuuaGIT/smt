@@ -35,7 +35,7 @@ pub const EPOCH_1_TO_1970: u64 = 719_162 * 24 * 60 * 60;
 /// Read paths honour the gates either way. WRITE paths do not: every record
 /// the editor emits is 1.0-format, so it refuses to touch a save below this
 /// (see editor::apply::plan_op) rather than produce a file the game can't
-/// load. Widening the accept list means auditing those write paths first.
+/// load.
 pub const FIRST_1_0_SAVE_VERSION: u32 = 46;
 
 /// Returns (header, offset where the compressed body begins).
@@ -51,7 +51,12 @@ pub fn parse_save_file_info(data: &[u8]) -> PResult<(SaveFileInfo, usize)> {
     }
     let save_version = c.u32()?;
     // COMPAT EXPERIMENT: 42 = Update 8.
-    if !matches!(save_version, 42 | 52 | 53 | 58 | 59 | 60) {
+    // The body layout is version-gated at 46 and 53. Later game patches have
+    // kept that layout while incrementing the save version, so rejecting all
+    // unknown future numbers would make an otherwise compatible save unloadable.
+    // Keep the known pre-1.0 v42 exception, and reject only versions from the
+    // old layouts that this parser cannot interpret safely.
+    if save_version != 42 && save_version < FIRST_1_0_SAVE_VERSION {
         return Err(perr!("Unsupported save version number {}.", save_version));
     }
     let build_version = c.u32()?;

@@ -124,7 +124,7 @@ fn check_size(property_size: u32, property_start: usize, pos: usize, ptype: &str
 #[inline]
 fn type_str<'a>(r: StrRef, data: &'a [u8]) -> std::borrow::Cow<'a, str> {
     if r.wide {
-        std::borrow::Cow::Owned(r.to_string(data))
+        std::borrow::Cow::Owned(r.decode(data))
     } else {
         String::from_utf8_lossy(r.bytes(data))
     }
@@ -395,7 +395,7 @@ pub fn parse_properties(
                     }
                     SetValues::Refs(v)
                 } else {
-                    return Err(perr!("Unhandled SetProperty type {}", st.to_string(c.data)));
+                    return Err(perr!("Unhandled SetProperty type {}", st.decode(c.data)));
                 };
                 check_size(property_size, start, c.pos, ptype)?;
                 PropertyValue::Set {
@@ -503,8 +503,8 @@ pub fn parse_properties(
                             {
                                 return Err(perr!(
                                     "Unexpected StructProperty name '{}' != propertyName '{}'",
-                                    name.to_string(c.data),
-                                    property_name.to_string(c.data)
+                                    name.decode(c.data),
+                                    property_name.decode(c.data)
                                 ));
                             }
                             c.confirm_string("StructProperty")?;
@@ -663,7 +663,7 @@ pub fn parse_properties(
                         at_s,
                         array_count,
                         start,
-                        property_name.to_string(c.data)
+                        property_name.decode(c.data)
                     ));
                 }
                 PropertyValue::Array(av)
@@ -881,7 +881,7 @@ pub fn parse_properties(
                 return Err(perr!(
                     "Unsupported propertyType '{}' for property '{}' at offset {} of size {} bytes",
                     other,
-                    property_name.to_string(c.data),
+                    property_name.decode(c.data),
                     c.pos,
                     property_size
                 ))

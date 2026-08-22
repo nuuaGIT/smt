@@ -109,7 +109,10 @@ pub fn decompress_save_file(
         ));
     }
 
-    let mut out: Vec<u8> = Vec::with_capacity(total_uncomp + BODY_EDIT_SLACK);
+    let capacity = total_uncomp
+        .checked_add(BODY_EDIT_SLACK)
+        .ok_or_else(|| perr!("Decompressed body size overflow"))?;
+    let mut out: Vec<u8> = Vec::with_capacity(capacity);
     out.resize(total_uncomp, 0);
 
     // Carve the output into per-chunk slices for parallel inflation.
@@ -150,13 +153,13 @@ pub fn decompress_save_file(
         for (ch, dst) in slices {
             inflate_chunk(data, ch, dst)?;
             done_bytes += ch.comp_len as u64;
-            if let Some(cb) = progress.as_deref_mut() {
+            if let Some(cb) = progress.as_mut() {
                 cb(done_bytes, total_file);
             }
         }
     }
 
-    if let Some(cb) = progress.as_deref_mut() {
+    if let Some(cb) = progress.as_mut() {
         cb(total_file, total_file);
     }
     Ok(out)

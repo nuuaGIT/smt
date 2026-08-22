@@ -23,6 +23,8 @@ pub struct ResourceNode {
     pub capacity_per_minute: f32,
     pub used_per_minute: f32,
     #[serde(default)]
+    pub planned_used_per_minute: Option<f32>,
+    #[serde(default)]
     pub usage_overridden: bool,
     pub note: String,
     #[serde(default)]
@@ -41,7 +43,10 @@ pub struct ResourceNode {
 
 impl ResourceNode {
     pub fn utilization(&self) -> f32 {
-        if self.capacity_per_minute <= 0.0 {
+        if !self.capacity_per_minute.is_finite()
+            || self.capacity_per_minute <= 0.0
+            || !self.used_per_minute.is_finite()
+        {
             0.0
         } else {
             (self.used_per_minute / self.capacity_per_minute).clamp(0.0, 1.0)
@@ -58,6 +63,10 @@ impl ResourceNode {
             } else {
                 self.capacity_per_minute
             };
+        } else if !self.used_per_minute.is_finite() {
+            // Unknown capacity may legitimately be temporary, but NaN/∞ is
+            // never a meaningful pending allocation and would poison totals.
+            self.used_per_minute = 0.0;
         }
     }
 }
@@ -73,6 +82,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             world_z: 0.0,
             capacity_per_minute: 600.0,
             used_per_minute: 500.0,
+            planned_used_per_minute: None,
             usage_overridden: false,
             note: "Something important goes here...".into(),
             extractor_instance: None,
@@ -91,6 +101,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             world_z: 0.0,
             capacity_per_minute: 780.0,
             used_per_minute: 0.0,
+            planned_used_per_minute: None,
             usage_overridden: false,
             note: "Something important goes here...".into(),
             extractor_instance: None,
@@ -109,6 +120,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             world_z: 0.0,
             capacity_per_minute: 600.0,
             used_per_minute: 300.0,
+            planned_used_per_minute: None,
             usage_overridden: false,
             note: "Something important goes here...".into(),
             extractor_instance: None,
@@ -127,6 +139,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             world_z: 0.0,
             capacity_per_minute: 300.0,
             used_per_minute: 0.0,
+            planned_used_per_minute: None,
             usage_overridden: false,
             note: "Something important goes here...".into(),
             extractor_instance: None,
@@ -145,6 +158,7 @@ pub fn demo_nodes() -> Vec<ResourceNode> {
             world_z: 0.0,
             capacity_per_minute: 300.0,
             used_per_minute: 250.0,
+            planned_used_per_minute: None,
             usage_overridden: false,
             note: "Something important goes here...".into(),
             extractor_instance: None,
@@ -212,6 +226,7 @@ impl ResourceNode {
             world_z: node.z,
             capacity_per_minute: 0.0,
             used_per_minute: 0.0,
+            planned_used_per_minute: None,
             usage_overridden: false,
             note: "Something important goes here...".into(),
             extractor_instance: None,
@@ -267,6 +282,12 @@ mod tests {
         assert!(nodes
             .iter()
             .any(|node| { node.extraction_method == ExtractionMethod::ResourceWellExtractor }));
+        assert!(!nodes.iter().any(|node| {
+            (node.world_x - 159_055.0).abs() < 0.1
+                && (node.world_y + 126_925.0).abs() < 0.1
+                && (node.world_z - 9_480.0).abs() < 0.1
+                && node.resource == "Uranium"
+        }));
     }
 
     #[test]
@@ -278,5 +299,8 @@ mod tests {
 
         assert_eq!(node.used_per_minute, node.capacity_per_minute);
         assert_eq!(node.utilization(), 1.0);
+
+        node.used_per_minute = f32::NAN;
+        assert_eq!(node.utilization(), 0.0);
     }
 }

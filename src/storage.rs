@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const APP_QUALIFIER: &str = "com";
@@ -13,18 +14,13 @@ const ACTIVE_SAVE_NAME: &str = "active_save.sav";
 const STATE_NAME: &str = "state.json";
 const CURRENT_STATE_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum Language {
+    #[default]
     English,
     German,
     French,
     Spanish,
-}
-
-impl Default for Language {
-    fn default() -> Self {
-        Self::English
-    }
 }
 
 impl Language {
@@ -70,6 +66,11 @@ pub struct NodeAllocation {
     pub capacity_per_minute: f32,
     pub used_per_minute: f32,
     pub note: String,
+    /// Optional savefile-bound planning value. When present, the UI displays
+    /// and counts this value against the theoretical maximum instead of the
+    /// extractor's currently available capacity.
+    #[serde(default)]
+    pub planned_used_per_minute: Option<f32>,
     /// `None` means a legacy allocation. Legacy positive values are treated
     /// as explicit usage; legacy zero values use the new claimed-node default.
     #[serde(default)]
@@ -99,6 +100,14 @@ pub struct MapArrow {
     pub end_world_y: f32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct MapRuler {
+    pub start_world_x: f32,
+    pub start_world_y: f32,
+    pub end_world_x: f32,
+    pub end_world_y: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MapText {
     pub world_x: f32,
@@ -122,6 +131,7 @@ pub enum MapAnnotation {
     Rectangle(MapRectangle),
     Circle(MapCircle),
     Arrow(MapArrow),
+    Ruler(MapRuler),
     Text(MapText),
     Stroke(MapStroke),
     StrokeErase(MapStrokeErase),
@@ -156,13 +166,19 @@ pub struct AppSettings {
     #[serde(default)]
     pub only_partial: bool,
     #[serde(default)]
+    pub only_planned: bool,
+    #[serde(default)]
     pub show_rails: bool,
     #[serde(default)]
     pub show_foundations: bool,
     #[serde(default)]
     pub show_belts: bool,
+    #[serde(default = "default_use_svg_map")]
+    pub use_svg_map: bool,
     #[serde(default = "default_right_panel_width")]
     pub right_panel_width: f32,
+    #[serde(default = "default_auto_refresh_minutes")]
+    pub auto_refresh_minutes: u32,
 }
 
 impl Default for AppSettings {
@@ -180,10 +196,13 @@ impl Default for AppSettings {
             show_grid: false,
             show_annotations: true,
             only_partial: false,
+            only_planned: false,
             show_rails: false,
             show_foundations: false,
             show_belts: false,
+            use_svg_map: true,
             right_panel_width: 320.0,
+            auto_refresh_minutes: 8,
         }
     }
 }
@@ -200,6 +219,10 @@ fn default_right_panel_width() -> f32 {
     320.0
 }
 
+fn default_auto_refresh_minutes() -> u32 {
+    8
+}
+
 fn default_resource_filter() -> String {
     "Alle Ressourcen".to_owned()
 }
@@ -213,6 +236,10 @@ fn default_node_scale() -> f32 {
 }
 
 fn default_show_annotations() -> bool {
+    true
+}
+
+fn default_use_svg_map() -> bool {
     true
 }
 
@@ -269,6 +296,8 @@ pub struct PersistentState {
     #[serde(default)]
     pub arrows_by_save: BTreeMap<String, Vec<MapArrow>>,
     #[serde(default)]
+    pub rulers_by_save: BTreeMap<String, Vec<MapRuler>>,
+    #[serde(default)]
     pub texts_by_save: BTreeMap<String, Vec<MapText>>,
     #[serde(default)]
     pub strokes_by_save: BTreeMap<String, Vec<MapStroke>>,
@@ -297,6 +326,7 @@ impl Default for PersistentState {
             rectangles_by_save: BTreeMap::new(),
             circles_by_save: BTreeMap::new(),
             arrows_by_save: BTreeMap::new(),
+            rulers_by_save: BTreeMap::new(),
             texts_by_save: BTreeMap::new(),
             strokes_by_save: BTreeMap::new(),
             drawing_history_by_save: BTreeMap::new(),
@@ -323,12 +353,30 @@ impl Storage {
             .with_context(|| format!("Konnte Datenordner nicht anlegen: {}", data_dir.display()))?;
 
         let state_path = data_dir.join(STATE_NAME);
+        let backup_path = state_backup_path(&state_path);
         let (state, state_was_migrated) = if state_path.exists() {
-            let state_json = fs::read_to_string(&state_path).with_context(|| {
-                format!("Konnte Statusdatei nicht lesen: {}", state_path.display())
-            })?;
-            load_state_compatibly(&state_json)
-                .with_context(|| format!("Statusdatei ist ungültig: {}", state_path.display()))?
+            match load_state_file(&state_path) {
+                Ok(value) => value,
+                Err(primary_error) if backup_path.exists() => load_state_file(&backup_path)
+                    .with_context(|| {
+                        format!(
+                            "Statusdatei und Sicherung sind ungültig: {}; {}",
+                            state_path.display(),
+                            primary_error
+                        )
+                    })
+                    .map(|(state, _)| (state, true))?,
+                Err(error) => return Err(error),
+            }
+        } else if backup_path.exists() {
+            load_state_file(&backup_path)
+                .with_context(|| {
+                    format!(
+                        "Statusdatei fehlt, Sicherung ist ungültig: {}",
+                        backup_path.display()
+                    )
+                })
+                .map(|(state, _)| (state, true))?
         } else {
             (PersistentState::default(), false)
         };
@@ -382,7 +430,7 @@ impl Storage {
             .to_owned();
         let snapshot = SaveSnapshot::from_bytes(file_name, &bytes);
 
-        fs::copy(source_path, &self.active_save_path).with_context(|| {
+        copy_file_atomically(source_path, &self.active_save_path).with_context(|| {
             format!(
                 "Konnte Savegame nicht in den App-Datenordner kopieren: {}",
                 self.active_save_path.display()
@@ -436,6 +484,7 @@ impl Storage {
         self.state.rectangles_by_save.clear();
         self.state.circles_by_save.clear();
         self.state.arrows_by_save.clear();
+        self.state.rulers_by_save.clear();
         self.state.texts_by_save.clear();
         self.state.strokes_by_save.clear();
         self.state.drawing_history_by_save.clear();
@@ -467,14 +516,33 @@ impl Storage {
             .unwrap_or("save.sav")
             .to_owned();
         let new_snapshot = SaveSnapshot::from_bytes(file_name, &new_bytes);
-        let old_bytes = self.active_bytes()?;
 
         if self.state.current_snapshot.as_ref() == Some(&new_snapshot) {
+            // The private copy can disappear independently (manual cleanup,
+            // antivirus quarantine, or a failed previous write). A refresh
+            // must repair it instead of reporting success and leaving the app
+            // unable to parse its active save on the next frame.
+            let active_is_current = fs::read(&self.active_save_path)
+                .ok()
+                .map(|bytes| {
+                    SaveSnapshot::from_bytes(new_snapshot.file_name.clone(), &bytes) == new_snapshot
+                })
+                .unwrap_or(false);
+            if !active_is_current {
+                copy_file_atomically(&source_path, &self.active_save_path).with_context(|| {
+                    format!(
+                        "Konnte fehlende lokale Savegame-Kopie nicht wiederherstellen: {}",
+                        self.active_save_path.display()
+                    )
+                })?;
+                self.persist()?;
+            }
             return Ok(RefreshResult::Unchanged);
         }
 
+        let old_bytes = self.active_bytes()?;
         let diff = DiffSummary::between(&old_bytes, &new_bytes);
-        fs::copy(&source_path, &self.active_save_path).with_context(|| {
+        copy_file_atomically(&source_path, &self.active_save_path).with_context(|| {
             format!(
                 "Konnte aktualisiertes Savegame nicht speichern: {}",
                 self.active_save_path.display()
@@ -504,8 +572,13 @@ impl Storage {
             .unwrap_or("save.sav")
             .to_owned();
         let new_snapshot = SaveSnapshot::from_bytes(file_name, &new_bytes);
-        let needs_copy = self.state.current_snapshot.as_ref() != Some(&new_snapshot)
-            || !self.active_save_path.exists();
+        let active_is_current = fs::read(&self.active_save_path)
+            .ok()
+            .map(|bytes| {
+                SaveSnapshot::from_bytes(new_snapshot.file_name.clone(), &bytes) == new_snapshot
+            })
+            .unwrap_or(false);
+        let needs_copy = !active_is_current;
         if !needs_copy {
             return Ok(());
         }
@@ -516,12 +589,27 @@ impl Storage {
         } else {
             DiffSummary::between(&old_bytes, &new_bytes)
         };
-        fs::copy(&source_path, &self.active_save_path).with_context(|| {
-            format!(
-                "Konnte aktuelles Savegame nicht aktualisieren: {}",
-                self.active_save_path.display()
-            )
-        })?;
+        if let Err(error) = copy_file_atomically(&source_path, &self.active_save_path) {
+            // A save can be briefly locked by Satisfactory, an antivirus
+            // scanner, or another SMT instance. Startup must remain usable
+            // when the previous private copy is still available; Refresh can
+            // retry the synchronization once the lock is gone.
+            let active_copy_is_available =
+                fs::metadata(&self.active_save_path).is_ok_and(|metadata| metadata.len() > 0);
+            if active_copy_is_available {
+                eprintln!(
+                    "SMT: startup save synchronization deferred for {}: {error:#}",
+                    self.active_save_path.display()
+                );
+                return Ok(());
+            }
+
+            // There is no usable private copy to parse. Leave the app in its
+            // empty state instead of reporting an initialization failure;
+            // the user can select the save again through Upload Savegame.
+            self.clear_unavailable_source()?;
+            return Ok(());
+        }
         self.state.previous_snapshot = self.state.current_snapshot.clone();
         self.state.current_snapshot = Some(new_snapshot);
         self.state.last_diff = Some(diff);
@@ -627,6 +715,20 @@ impl Storage {
         self.persist()
     }
 
+    pub fn active_rulers(&self) -> Vec<MapRuler> {
+        self.state
+            .rulers_by_save
+            .get(&self.active_profile_key())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn save_active_rulers(&mut self, rulers: Vec<MapRuler>) -> Result<()> {
+        let profile_key = self.active_profile_key();
+        self.state.rulers_by_save.insert(profile_key, rulers);
+        self.persist()
+    }
+
     pub fn active_texts(&self) -> Vec<MapText> {
         self.state
             .texts_by_save
@@ -687,12 +789,58 @@ impl Storage {
     fn persist(&self) -> Result<()> {
         let json = serde_json::to_string_pretty(&self.state)
             .context("Konnte App-Status nicht serialisieren")?;
-        fs::write(&self.state_path, json).with_context(|| {
+        let temporary_path = state_temporary_path(&self.state_path);
+        let backup_path = state_backup_path(&self.state_path);
+
+        let mut temporary_file = fs::File::create(&temporary_path).with_context(|| {
             format!(
-                "Konnte Status nicht speichern: {}",
-                self.state_path.display()
+                "Konnte temporäre Statusdatei nicht anlegen: {}",
+                temporary_path.display()
             )
         })?;
+        temporary_file
+            .write_all(json.as_bytes())
+            .and_then(|_| temporary_file.sync_all())
+            .with_context(|| {
+                format!(
+                    "Konnte temporäre Statusdatei nicht vollständig schreiben: {}",
+                    temporary_path.display()
+                )
+            })?;
+        drop(temporary_file);
+
+        let had_previous_state = self.state_path.exists();
+        if had_previous_state {
+            if backup_path.exists() {
+                let _ = fs::remove_file(&backup_path);
+            }
+            fs::rename(&self.state_path, &backup_path).with_context(|| {
+                format!(
+                    "Konnte bisherige Statusdatei nicht sichern: {}",
+                    self.state_path.display()
+                )
+            })?;
+        }
+
+        if let Err(error) = fs::rename(&temporary_path, &self.state_path) {
+            if had_previous_state && !self.state_path.exists() {
+                let _ = fs::rename(&backup_path, &self.state_path);
+            }
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error).with_context(|| {
+                format!(
+                    "Konnte Status nicht speichern: {}",
+                    self.state_path.display()
+                )
+            });
+        }
+
+        // The new file is already in place. The backup is only needed while a
+        // replacement is in flight; leaving it behind would make stale data
+        // look like a valid recovery candidate after a later clean shutdown.
+        if backup_path.exists() {
+            let _ = fs::remove_file(backup_path);
+        }
         Ok(())
     }
 }
@@ -722,6 +870,80 @@ fn allocation_profile_key(path: &Path) -> String {
 
 fn current_state_version() -> u32 {
     CURRENT_STATE_VERSION
+}
+
+fn state_temporary_path(path: &Path) -> PathBuf {
+    sibling_with_suffix(path, "tmp")
+}
+
+fn state_backup_path(path: &Path) -> PathBuf {
+    sibling_with_suffix(path, "bak")
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(STATE_NAME),
+        suffix
+    ))
+}
+
+fn copy_file_atomically(source: &Path, destination: &Path) -> Result<()> {
+    let temporary_path = sibling_with_suffix(destination, "tmp");
+    let backup_path = sibling_with_suffix(destination, "bak");
+    fs::copy(source, &temporary_path).with_context(|| {
+        format!(
+            "Konnte Datei nicht in temporäre Kopie schreiben: {}",
+            temporary_path.display()
+        )
+    })?;
+    fs::File::open(&temporary_path)
+        .and_then(|file| file.sync_all())
+        .with_context(|| {
+            format!(
+                "Konnte temporäre Kopie nicht vollständig sichern: {}",
+                temporary_path.display()
+            )
+        })?;
+
+    let had_previous = destination.exists();
+    if had_previous {
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        fs::rename(destination, &backup_path).with_context(|| {
+            format!(
+                "Konnte bisherige lokale Kopie nicht sichern: {}",
+                destination.display()
+            )
+        })?;
+    }
+
+    if let Err(error) = fs::rename(&temporary_path, destination) {
+        if had_previous && !destination.exists() {
+            let _ = fs::rename(&backup_path, destination);
+        }
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error).with_context(|| {
+            format!(
+                "Konnte lokale Kopie nicht ersetzen: {}",
+                destination.display()
+            )
+        });
+    }
+    if backup_path.exists() {
+        let _ = fs::remove_file(backup_path);
+    }
+    Ok(())
+}
+
+fn load_state_file(path: &Path) -> Result<(PersistentState, bool)> {
+    let state_json = fs::read_to_string(path)
+        .with_context(|| format!("Konnte Statusdatei nicht lesen: {}", path.display()))?;
+    load_state_compatibly(&state_json)
+        .with_context(|| format!("Statusdatei ist ungültig: {}", path.display()))
 }
 
 /// Load the state through a small compatibility boundary instead of relying on
@@ -771,6 +993,7 @@ mod tests {
         assert!(!AppSettings::default().show_node_names);
         assert_eq!(AppSettings::default().right_panel_width, 320.0);
         assert_eq!(AppSettings::default().language, Language::English);
+        assert!(AppSettings::default().use_svg_map);
     }
 
     #[test]
@@ -814,6 +1037,7 @@ mod tests {
         assert!(!state.settings.show_grid);
         assert!(!state.settings.only_partial);
         assert_eq!(state.settings.language, Language::English);
+        assert!(state.settings.use_svg_map);
     }
 
     #[test]

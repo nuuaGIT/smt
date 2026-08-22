@@ -55,6 +55,23 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SMT",
         options,
-        Box::new(|_creation_context| Ok(Box::new(app::TrackerApp::load()))),
+        Box::new(|creation_context| {
+            install_app_font(&creation_context.egui_ctx);
+            Ok(Box::new(app::TrackerApp::load()))
+        }),
     )
+}
+
+fn install_app_font(context: &eframe::egui::Context) {
+    let mut fonts = eframe::egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "smt-normal".to_owned(),
+        eframe::egui::FontData::from_static(include_bytes!("../data/font/normal.ttf")),
+    );
+    fonts
+        .families
+        .get_mut(&eframe::egui::FontFamily::Proportional)
+        .expect("egui provides a proportional font family")
+        .insert(0, "smt-normal".to_owned());
+    context.set_fonts(fonts);
 }

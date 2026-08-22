@@ -173,6 +173,14 @@ fn parse_rail_point(
         property_vector(store, properties, "LeaveTangent").unwrap_or([0.0; 3]),
         actor.rotation,
     );
+    if location
+        .iter()
+        .chain(arrive_tangent.iter())
+        .chain(leave_tangent.iter())
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
     Some(ParsedRailPoint {
         location,
         arrive_tangent,
@@ -266,14 +274,14 @@ fn parse_buildable_layers(store: &SaveStore) -> (Vec<ParsedFoundation>, Vec<Pars
                         }
                         let (half_width, half_height) = foundation_half_size(&build_path);
                         for instance in group.instances {
-                            foundations.push(ParsedFoundation {
-                                corners: foundation_corners(
-                                    instance.position,
-                                    instance.rotation,
-                                    half_width,
-                                    half_height,
-                                ),
-                            });
+                            if let Some(corners) = foundation_corners(
+                                instance.position,
+                                instance.rotation,
+                                half_width,
+                                half_height,
+                            ) {
+                                foundations.push(ParsedFoundation { corners });
+                            }
                         }
                     }
                 }
@@ -334,22 +342,31 @@ fn foundation_corners(
     rotation: [f64; 4],
     half_width: f32,
     half_height: f32,
-) -> [[f32; 3]; 4] {
+) -> Option<[[f32; 3]; 4]> {
     let center = [position[0] as f32, position[1] as f32, position[2] as f32];
+    if center.iter().any(|value| !value.is_finite())
+        || rotation.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
     let local_corners = [
         [-half_width, -half_height, 0.0],
         [half_width, -half_height, 0.0],
         [half_width, half_height, 0.0],
         [-half_width, half_height, 0.0],
     ];
-    local_corners.map(|corner| {
+    let corners = local_corners.map(|corner| {
         let rotated = rotate_f64_vector(corner, rotation);
         [
             center[0] + rotated[0],
             center[1] + rotated[1],
             center[2] + rotated[2],
         ]
-    })
+    });
+    corners
+        .iter()
+        .all(|corner| corner.iter().all(|value| value.is_finite()))
+        .then_some(corners)
 }
 
 fn finite_vec3(values: [f64; 3]) -> Option<[f32; 3]> {
@@ -506,7 +523,9 @@ mod tests {
         assert!(is_resource_extractor(
             "/Game/FactoryGame/Buildable/Factory/FrackingSmasher/Build_FrackingSmasher.Build_FrackingSmasher_C"
         ));
-        assert!(is_resource_extractor("/Game/Equip_ResourceMiner.Equip_ResourceMiner_C") == false);
+        assert!(!is_resource_extractor(
+            "/Game/Equip_ResourceMiner.Equip_ResourceMiner_C"
+        ));
         assert!(!is_resource_extractor(
             "/Game/Build_Constructor.Build_Constructor_C"
         ));

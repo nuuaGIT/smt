@@ -1,5 +1,44 @@
 use crate::storage::Language;
 
+/// Format a number using the conventions of the selected UI language.
+/// English uses `1,234.56`, German and Spanish use `1.234,56`, and French
+/// uses a narrow non-breaking space for thousands: `1 234,56`.
+pub fn format_number(language: Language, value: f64, decimals: usize) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+
+    let negative = value.is_sign_negative();
+    let absolute = value.abs();
+    let raw = format!("{absolute:.decimals$}");
+    let (integer, fraction) = raw.split_once('.').unwrap_or((&raw, ""));
+    let separator = match language {
+        Language::English => ',',
+        Language::German | Language::Spanish => '.',
+        Language::French => '\u{202f}',
+    };
+    let decimal = match language {
+        Language::English => '.',
+        Language::German | Language::French | Language::Spanish => ',',
+    };
+
+    let mut grouped = String::with_capacity(raw.len() + raw.len() / 3 + 2);
+    if negative {
+        grouped.push('-');
+    }
+    for (index, character) in integer.chars().enumerate() {
+        if index > 0 && (integer.len() - index).is_multiple_of(3) {
+            grouped.push(separator);
+        }
+        grouped.push(character);
+    }
+    if decimals > 0 {
+        grouped.push(decimal);
+        grouped.push_str(fraction);
+    }
+    grouped
+}
+
 /// Small, dependency-free UI dictionary. Savegame data and resource names stay
 /// in their game-provided form; only application chrome and explanatory text
 /// are translated here.
@@ -21,14 +60,21 @@ pub fn text(language: Language, key: &str) -> &'static str {
             "Échec de l'initialisation",
             "Error de inicialización",
         ),
-        "upload_save" => ("＋  Upload savegame", "＋  Savegame hochladen", "＋  Charger une sauvegarde", "＋  Cargar partida"),
+        "upload_save" => ("↑  Upload savegame", "↑  Savegame hochladen", "↑  Charger une sauvegarde", "↑  Cargar partida"),
         "refresh" => ("↻  Refresh", "↻  Refresh", "↻  Actualiser", "↻  Actualizar"),
-        "remove_save" => ("✕  Remove savegame", "✕  Savegame entfernen", "✕  Retirer la sauvegarde", "✕  Quitar partida"),
+        "remove_save" => ("×  Remove savegame", "×  Savegame entfernen", "×  Retirer la sauvegarde", "×  Quitar partida"),
         "settings" => ("Settings", "Einstellungen", "Paramètres", "Ajustes"),
+        "settings_application" => ("Application", "Anwendung", "Application", "Aplicación"),
+        "settings_map" => ("Map & nodes", "Karte & Nodes", "Carte et nodes", "Mapa y nodos"),
+        "settings_display" => ("Display & performance", "Darstellung & Performance", "Affichage et performances", "Pantalla y rendimiento"),
+        "settings_testing" => ("Testing stuff", "Testing stuff", "Fonctions de test", "Funciones de prueba"),
         "language" => ("Language", "Sprache", "Langue", "Idioma"),
         "node_names" => ("Show node names", "Node-Namen anzeigen", "Afficher les noms des nodes", "Mostrar nombres de nodos"),
         "debug_mode" => ("Debug mode", "Debug-Modus", "Mode débogage", "Modo de depuración"),
         "pause_background" => ("Do not render map when unfocused", "Map bei Alt-Tab nicht rendern", "Ne pas afficher la carte en arrière-plan", "No renderizar el mapa en segundo plano"),
+        "auto_refresh" => ("Auto-refresh (minutes)", "Auto-Refresh (Minuten)", "Actualisation automatique (minutes)", "Actualización automática (minutos)"),
+        "analysis_duration" => ("Analysis", "Analyse", "Analyse", "Análisis"),
+        "last_updated" => ("Last update", "Letzte Aktualisierung", "Dernière mise à jour", "Última actualización"),
         "show_annotations" => ("Show drawings and shapes", "Gemaltes und Formen anzeigen", "Afficher les dessins et formes", "Mostrar dibujos y formas"),
         "more" => ("More", "Mehr", "Plus", "Más"),
         "delete_all_smt_notes" => ("Delete All SMT Notes", "Alle SMT-Notizen löschen", "Supprimer toutes les notes SMT", "Eliminar todas las notas de SMT"),
@@ -65,16 +111,26 @@ pub fn text(language: Language, key: &str) -> &'static str {
         "panel_resize_hint" => ("Drag the left edge to resize. Push it to the right edge to close.", "Panelbreite durch Ziehen der linken Kante ändern. Ganz nach rechts zusammenschieben schließt es.", "Tirez le bord gauche pour redimensionner. Repoussez-le vers le bord droit pour fermer.", "Arrastra el borde izquierdo para cambiar el tamaño. Llévalo al borde derecho para cerrarlo."),
         "app_title" => ("Satisfactory Map Tracker", "Satisfactory Map Tracker", "Satisfactory Map Tracker", "Satisfactory Map Tracker"),
         "draw_rectangle" => ("▭  Draw rectangle", "▭  Rechteck zeichnen", "▭  Dessiner un rectangle", "▭  Dibujar rectángulo"),
+        "drawing_toolbar" => ("Draw", "Zeichnen", "Dessiner", "Dibujar"),
+        "tool_rectangle" => ("Rectangle", "Rechteck", "Rectangle", "Rectángulo"),
         "cancel_rectangle" => ("×  Cancel drawing", "×  Zeichnen abbrechen", "×  Annuler le dessin", "×  Cancelar dibujo"),
         "draw_circle" => ("○  Draw circle", "○  Kreis zeichnen", "○  Dessiner un cercle", "○  Dibujar círculo"),
+        "tool_circle" => ("Circle", "Kreis", "Cercle", "Círculo"),
         "cancel_circle" => ("×  Cancel circle", "×  Kreis abbrechen", "×  Annuler le cercle", "×  Cancelar círculo"),
         "draw_arrow" => ("➜  Draw arrow", "➜  Pfeil zeichnen", "➜  Dessiner une flèche", "➜  Dibujar flecha"),
+        "tool_arrow" => ("Arrow", "Pfeil", "Flèche", "Flecha"),
         "cancel_arrow" => ("×  Cancel arrow", "×  Pfeil abbrechen", "×  Annuler la flèche", "×  Cancelar flecha"),
+        "draw_ruler" => ("⌁  Ruler", "⌁  Lineal", "⌁  Règle", "⌁  Regla"),
+        "tool_ruler" => ("Ruler", "Lineal", "Règle", "Regla"),
+        "cancel_ruler" => ("×  Stop ruler", "×  Lineal stoppen", "×  Arrêter la règle", "×  Detener regla"),
         "draw_text" => ("T  Add text", "T  Text hinzufügen", "T  Ajouter du texte", "T  Añadir texto"),
+        "tool_text" => ("Text", "Text", "Texte", "Texto"),
         "cancel_text" => ("×  Cancel text", "×  Text abbrechen", "×  Annuler le texte", "×  Cancelar texto"),
         "draw_pen" => ("✎  Draw", "✎  Stift", "✎  Dessiner", "✎  Dibujar"),
+        "tool_pen" => ("Pen", "Stift", "Stylo", "Lápiz"),
         "cancel_pen" => ("×  Stop pen", "×  Stift stoppen", "×  Arrêter le stylo", "×  Detener lápiz"),
         "draw_eraser" => ("⌫  Eraser", "⌫  Radierer", "⌫  Gomme", "⌫  Borrador"),
+        "tool_eraser" => ("Eraser", "Radierer", "Gomme", "Borrador"),
         "cancel_eraser" => ("×  Stop eraser", "×  Radierer stoppen", "×  Arrêter la gomme", "×  Detener borrador"),
         "text_label" => ("Text", "Text", "Texte", "Texto"),
         "save_text" => ("Save", "Speichern", "Enregistrer", "Guardar"),
@@ -82,6 +138,8 @@ pub fn text(language: Language, key: &str) -> &'static str {
         "rectangle" => ("Rectangle", "Rechteck", "Rectangle", "Rectángulo"),
         "circle" => ("Circle", "Kreis", "Cercle", "Círculo"),
         "arrow" => ("Arrow", "Pfeil", "Flèche", "Flecha"),
+        "ruler" => ("Ruler", "Lineal", "Règle", "Regla"),
+        "distance" => ("Distance", "Distanz", "Distance", "Distancia"),
         "delete_annotation" => ("Delete drawing", "Zeichnung löschen", "Supprimer le dessin", "Eliminar dibujo"),
         "move_annotation" => ("Move", "Verschieben", "Déplacer", "Mover"),
         "move_rectangle" => ("Move", "Verschieben", "Déplacer", "Mover"),
@@ -95,7 +153,7 @@ pub fn text(language: Language, key: &str) -> &'static str {
         "save_status" => ("Savegame status", "Savegame-Status", "État de la sauvegarde", "Estado de la partida"),
         "no_saved_save" => ("No savegame stored yet.", "Noch kein Savegame gespeichert.", "Aucune sauvegarde enregistrée.", "Todavía no hay ninguna partida guardada."),
         "local_copy" => ("Local copy", "Lokale Kopie", "Copie locale", "Copia local"),
-        "resource_remaining" => ("Resources remaining", "Ressourcen übrig", "Ressources restantes", "Recursos restantes"),
+        "resource_remaining" => ("Resources used", "Verwendete Ressourcen", "Ressources utilisées", "Recursos utilizados"),
         "no_extractors" => ("No placed extractor data loaded yet.", "Noch keine platzierten Extractor-Daten geladen.", "Aucune donnée d'extracteur placé n'est encore chargée.", "Aún no se han cargado extractores colocados."),
         "available_per_minute" => ("available per minute", "pro Minute verfügbar", "disponibles par minute", "disponibles por minuto"),
         "not_fully_used" => ("not fully used", "nicht vollständig genutzt", "non utilisés complètement", "no utilizados por completo"),
@@ -109,7 +167,9 @@ pub fn text(language: Language, key: &str) -> &'static str {
         "all_purities" => ("All purities", "Alle Reinheiten", "Toutes les puretés", "Todas las purezas"),
         "claimed_only" => ("Claimed nodes only", "Nur geclaimte Nodes", "Nodes revendiqués uniquement", "Solo nodos reclamados"),
         "partial_only" => ("Partially used nodes only", "Nur nicht vollständig genutzte Nodes", "Nodes partiellement utilisés uniquement", "Solo nodos parcialmente usados"),
+        "planned_only" => ("Planned nodes only", "Nur geplante Nodes", "Nodes planifiés uniquement", "Solo nodos planificados"),
         "grid" => ("Show coordinate grid", "Koordinatenraster anzeigen", "Afficher la grille de coordonnées", "Mostrar cuadrícula de coordenadas"),
+        "detailed_png_map" => ("Use detailed PNG map", "Detaillierte PNG-Karte verwenden", "Utiliser la carte PNG détaillée", "Usar mapa PNG detallado"),
         "world_data_hint" => ("The map and positions come from local world data.", "Karte und Positionen stammen aus den lokalen Welt-Daten.", "La carte et les positions proviennent des données locales du monde.", "El mapa y las posiciones proceden de los datos locales del mundo."),
         "reset_view" => ("Reset view", "Ansicht zurücksetzen", "Réinitialiser la vue", "Restablecer vista"),
         "close" => ("Close", "Schließen", "Fermer", "Cerrar"),
@@ -118,6 +178,8 @@ pub fn text(language: Language, key: &str) -> &'static str {
         "yield" => ("Yield", "Ertrag", "Rendement", "Producción"),
         "theoretical_yield" => ("Theoretical miner yield", "Theoretischer Miner-Ertrag", "Rendement théorique du mineur", "Producción teórica del minero"),
         "maximum_settable" => ("Maximum settable", "Maximal einstellbar", "Maximum réglable", "Máximo configurable"),
+        "max_value" => ("Max", "Max", "Max", "Máx."),
+        "max_possible" => ("Max possible", "Maximal möglich", "Maximum possible", "Máximo posible"),
         "powershards_clock" => ("Powershards", "Powershards", "Powershards", "Powershards"),
         "used_per_minute" => ("used per minute", "pro Minute verwendet", "utilisés par minute", "usados por minuto"),
         "free_per_minute" => ("Free", "Frei", "Libre", "Libre"),
@@ -149,5 +211,31 @@ pub fn text(language: Language, key: &str) -> &'static str {
         Language::German => german,
         Language::French => french,
         Language::Spanish => spanish,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_number;
+    use crate::storage::Language;
+
+    #[test]
+    fn formats_numbers_using_each_locale() {
+        assert_eq!(
+            format_number(Language::English, 1_234_567.89, 2),
+            "1,234,567.89"
+        );
+        assert_eq!(
+            format_number(Language::German, 1_234_567.89, 2),
+            "1.234.567,89"
+        );
+        assert_eq!(
+            format_number(Language::Spanish, 1_234_567.89, 2),
+            "1.234.567,89"
+        );
+        assert_eq!(
+            format_number(Language::French, 1_234_567.89, 2),
+            "1\u{202f}234\u{202f}567,89"
+        );
     }
 }
